@@ -25,8 +25,10 @@ import multiprocessing as mp
 import os
 import signal
 import threading
+from multiprocessing import shared_memory
 from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
 
+import atomics
 import zmq
 import zmq.asyncio
 from PIL.Image import Image
@@ -43,6 +45,8 @@ from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
 )
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
+from sglang.srt.managers.energy_monitor import run_energy_monitor_process
+from sglang.srt.managers.freq_manager import run_freq_manager_process
 from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
@@ -122,10 +126,19 @@ class Engine(EngineBase):
         port_args = PortArgs.init_new(server_args)
         logger.info(f"{server_args=}")
 
+        gpu_freq_shm = shared_memory.SharedMemory(create=True, size=4)
+        gpu_power_shm = shared_memory.SharedMemory(create=True, size=4)
+        gpu_energy_shm = shared_memory.SharedMemory(create=True, size=4)
+        with atomics.atomicview(buffer=gpu_freq_shm.buf[:4], atype=atomics.UINT) as a:
+            a.store(0)
+
         # Launch subprocesses
         tokenizer_manager, scheduler_info = _launch_subprocesses(
             server_args=server_args,
             port_args=port_args,
+            gpu_freq_shm_name=gpu_freq_shm.name,
+            gpu_power_shm_name=gpu_power_shm.name,
+            gpu_energy_shm_name=gpu_energy_shm.name,
         )
         self.server_args = server_args
         self.tokenizer_manager = tokenizer_manager
@@ -648,7 +661,7 @@ def _set_envs_and_config(server_args: ServerArgs):
 
 
 def _launch_subprocesses(
-    server_args: ServerArgs, port_args: Optional[PortArgs] = None
+    server_args: ServerArgs, port_args: Optional[PortArgs] = None, **kwargs,
 ) -> Tuple[TokenizerManager, Dict]:
     """
     Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
@@ -667,6 +680,9 @@ def _launch_subprocesses(
     server_args.model_path, server_args.tokenizer_path = prepare_model_and_tokenizer(
         server_args.model_path, server_args.tokenizer_path
     )
+
+    if server_args.nnodes > 1:
+        raise NotImplementedError("Multi-node is not supported yet for VoltanaLLM.")
 
     scheduler_procs = []
     if server_args.dp_size == 1:
@@ -709,6 +725,11 @@ def _launch_subprocesses(
                         None,
                         writer,
                     ),
+                    kwargs={
+                        "gpu_freq_shm_name": kwargs["gpu_freq_shm_name"],
+                        "gpu_power_shm_name": kwargs["gpu_power_shm_name"],
+                        "gpu_energy_shm_name": kwargs["gpu_energy_shm_name"],
+                    },
                 )
                 with memory_saver_adapter.configure_subprocess():
                     proc.start()
@@ -786,6 +807,34 @@ def _launch_subprocesses(
                 "Initialization failed. Please see the error messages above."
             )
         scheduler_infos.append(data)
+
+    # Freq monitoring
+    if server_args.enable_freq_manager:
+        freq_manger_proc = mp.Process(
+            target=run_freq_manager_process,
+            args=(server_args, port_args),
+            kwargs={
+                "gpu_freq_shm_name": kwargs["gpu_freq_shm_name"],
+                "gpu_power_shm_name": kwargs["gpu_power_shm_name"],
+                "gpu_energy_shm_name": kwargs["gpu_energy_shm_name"],
+            },
+        )
+        freq_manger_proc.start()
+
+    # Energy monitoring
+    if server_args.enable_energy_monitor:
+        energy_monitor_proc = mp.Process(
+            target=run_energy_monitor_process,
+            args=(server_args, port_args),
+            kwargs={
+                "gpu_freq_shm_name": kwargs["gpu_freq_shm_name"],
+                "gpu_power_shm_name": kwargs["gpu_power_shm_name"],
+                "gpu_energy_shm_name": kwargs["gpu_energy_shm_name"],
+            },
+        )
+        energy_monitor_proc.start()
+
+    logger.info("All processes are ready.")
 
     # Assume all schedulers have the same scheduler_info
     scheduler_info = scheduler_infos[0]

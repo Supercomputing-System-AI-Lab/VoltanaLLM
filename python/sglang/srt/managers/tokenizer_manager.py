@@ -83,6 +83,7 @@ from sglang.srt.managers.io_struct import (
     HealthCheckOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    MetricsForFreq,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
@@ -143,6 +144,13 @@ class ReqState:
     last_time: float = 0.0
     last_completion_tokens: int = 1
 
+    # for non-stream
+    ns_created_time: float = None
+    ns_first_token_time: float = None
+    ns_first_token_time_real: float = None
+    ns_second_token_time_real: float = None
+    ns_finished_time: float = None
+
     # For streaming output
     last_output_offset: int = 0
     # For incremental state update.
@@ -188,6 +196,12 @@ class TokenizerManager:
         )
         self.send_to_scheduler = get_zmq_socket(
             context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
+        )
+        self.send_to_freq_manager = get_zmq_socket(
+            context, zmq.PUSH, port_args.metric_monitor_ipc_name, False
+        )
+        self.send_to_freq_manager_settings = get_zmq_socket(
+            context, zmq.PUSH, port_args.control_freq_manager_ipc_name, False
         )
 
         # Read model args
@@ -308,6 +322,9 @@ class TokenizerManager:
         self.set_internal_state_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.get_metrics_for_freq_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.expert_distribution_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -374,6 +391,10 @@ class TokenizerManager:
                     self.set_internal_state_communicator.handle_recv,
                 ),
                 (
+                    MetricsForFreq,
+                    self.get_metrics_for_freq_communicator.handle_recv,
+                ),
+                (
                     ExpertDistributionReqOutput,
                     self.expert_distribution_communicator.handle_recv,
                 ),
@@ -400,6 +421,9 @@ class TokenizerManager:
 
         self.current_load = 0
         self.current_load_lock = asyncio.Lock()
+
+        self.non_stream_return_all = server_args.non_stream_return_all
+        self.monitor_iteration_metrics = server_args.monitor_iteration_metrics
 
     async def generate_request(
         self,
@@ -442,6 +466,13 @@ class TokenizerManager:
             is_single = obj.is_single
             if is_single:
                 tokenized_obj = await self._tokenize_one_request(obj)
+
+                # NOTE: monitor arrival time and input length for freq manager
+                if self.monitor_iteration_metrics:
+                    now = time.perf_counter()
+                    inlen = len(tokenized_obj.input_ids)
+                    self.send_to_freq_manager.send_pyobj((now, inlen), flags=zmq.NOBLOCK, copy=False)
+
                 state = self._send_one_request(obj, tokenized_obj, created_time)
                 async for response in self._wait_one_response(obj, state, request):
                     yield response
@@ -597,6 +628,7 @@ class TokenizerManager:
                 custom_logit_processor=obj.custom_logit_processor,
                 return_hidden_states=obj.return_hidden_states,
                 data_parallel_rank=obj.data_parallel_rank,
+                num_forward_repeat=obj.num_forward_repeat
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
@@ -662,6 +694,8 @@ class TokenizerManager:
     ):
         self.send_to_scheduler.send_pyobj(tokenized_obj)
         state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
+        if self.non_stream_return_all:
+            state.ns_created_time = time.perf_counter()
         self.rid_to_state[obj.rid] = state
         return state
 
@@ -687,7 +721,16 @@ class TokenizerManager:
 
             out = state.out_list[-1]
 
-            state.out_list = []
+            if self.non_stream_return_all:
+                if state.ns_first_token_time is None:
+                    state.ns_first_token_time = time.perf_counter()
+                    state.ns_first_token_time_real = time.time()
+                if out["meta_info"].get("cur_token_time") is None:
+                    out["meta_info"]["cur_token_time"] = time.perf_counter()
+
+            if not self.monitor_iteration_metrics:
+                state.out_list = []
+
             if state.finished:
                 if self.log_requests:
                     max_length, skip_names, out_skip_names = self.log_request_metadata
@@ -705,6 +748,24 @@ class TokenizerManager:
                         and finish_reason.get("status_code") == HTTPStatus.BAD_REQUEST
                     ):
                         raise ValueError(finish_reason["message"])
+
+                if (not obj.stream) and self.non_stream_return_all:
+
+                    state.ns_finished_time = time.perf_counter()
+
+                    e2e = (state.ns_finished_time - state.ns_created_time)
+                    ttft = (state.ns_first_token_time - state.ns_created_time)
+                    token_time_list = [s["meta_info"]["cur_token_time"] for s in state.out_list]
+
+                    assert all(t is not None for t in token_time_list), "All cur_token_time should be set"
+                    itl_list = [(a - b) for (a, b) in zip(token_time_list[1:], token_time_list[:-1])]
+
+                    out["non_stream_metrics"] = {
+                        "first_token_ts": state.ns_first_token_time_real,
+                        "e2e": e2e,
+                        "ttft": ttft,
+                        "itl_list": itl_list,
+                    }
 
                 yield out
                 break
@@ -1212,6 +1273,8 @@ class TokenizerManager:
 
             if isinstance(recv_obj, BatchStrOut):
                 state.text += recv_obj.output_strs[i]
+                meta_info["extra_batch_info"] = recv_obj.extra_batch_info
+                meta_info["cur_token_time"] = recv_obj.cur_token_times[i]
                 out_dict = {
                     "text": state.text,
                     "meta_info": meta_info,

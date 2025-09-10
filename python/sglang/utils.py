@@ -1,7 +1,9 @@
 """Common utilities"""
 
 import base64
+import functools
 import importlib
+import inspect
 import json
 import logging
 import os
@@ -15,17 +17,36 @@ import traceback
 import urllib.request
 import weakref
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ContextDecorator
 from io import BytesIO
 from json import dumps
 from typing import Any, Callable, List, Optional, Tuple, Type, Union
 
 import numpy as np
+import pynvml
 import requests
 from IPython.display import HTML, display
 from pydantic import BaseModel
 from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
+
+
+def get_bool_env_var(name: str, default: str = "false") -> bool:
+    value = os.getenv(name, default)
+    value = value.lower()
+
+    truthy_values = ("true", "1")
+    falsy_values = ("false", "0")
+
+    if (value not in truthy_values) and (value not in falsy_values):
+        if value not in _warned_bool_env_var_keys:
+            logger.warning(
+                f"get_bool_env_var({name}) see non-understandable value={value} and treat as false"
+            )
+        _warned_bool_env_var_keys.add(value)
+
+    return value in truthy_values
 
 
 def convert_json_schema_to_str(json_schema: Union[dict, str, Type[BaseModel]]) -> str:
@@ -521,3 +542,62 @@ def resolve_obj_by_qualname(qualname: str) -> Any:
     module_name, obj_name = qualname.rsplit(".", 1)
     module = importlib.import_module(module_name)
     return getattr(module, obj_name)
+
+
+# A context manager to measure the time taken by a code block.
+class TimeMeasurementContext(ContextDecorator):
+    def __init__(self, name: str, enabled: bool = False, print_on_exit: bool = True):
+        self._name = name
+        self._enabled = enabled
+        self._print_on_exit = print_on_exit
+        self._start_time = None
+        self._end_time = None
+        self._elapsed_time = None
+
+    def __enter__(self):
+        if not self._enabled:
+            return self
+        self._start_time = time.perf_counter()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if not self._enabled:
+            return
+        self._end_time = time.perf_counter()
+        self._elapsed_time = self._end_time - self._start_time
+        if self._print_on_exit:
+            print(f"{self._name} took {self._elapsed_time * 1000:.6f} ms")
+
+    @property
+    def elapsed_time(self):
+        return self._elapsed_time
+
+
+def measure_func_time(func):
+    """
+    A decorator to measure the time taken by a function.
+    """
+    measure_time_func_time = get_bool_env_var("MEASURE_FUNC_TIME", "false")
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+
+        if not measure_time_func_time:
+            return func(*args, **kwargs)
+
+        start_time = time.perf_counter()
+
+        result = func(*args, **kwargs)
+
+        end_time = time.perf_counter()
+        elapsed_time = (end_time - start_time) * 1000
+
+        frame = inspect.currentframe().f_back
+        filepath = frame.f_code.co_filename
+        lineno = frame.f_lineno
+        func_name = func.__name__
+        if '/' in filepath:
+            filepath = filepath.split('/')[-1]
+
+        print(f"Func `{func_name}` ({filepath}:{lineno}) took {elapsed_time:.6f} ms")
+        return result
+    return wrapper

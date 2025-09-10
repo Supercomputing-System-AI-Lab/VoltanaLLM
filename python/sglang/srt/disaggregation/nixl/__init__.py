@@ -3,4 +3,7 @@ from sglang.srt.disaggregation.nixl.conn import (
     NixlKVManager,
     NixlKVReceiver,
     NixlKVSender,
+    FakeNixlKVReceiver,
+    FakeNixlKVSender,
+    FakeNixlKVManager,
 )

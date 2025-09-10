@@ -1,3 +1,4 @@
+import os
 import argparse
 import dataclasses
 
@@ -5,13 +6,26 @@ import dataclasses
 @dataclasses.dataclass
 class LBArgs:
     rust_lb: bool = False
+    echo_lb: bool = False
+    mp_workers: int = 4
     host: str = "0.0.0.0"
     port: int = 8000
-    policy: str = "random"
+    policy: str = "rr"
     prefill_infos: list = dataclasses.field(default_factory=list)
     decode_infos: list = dataclasses.field(default_factory=list)
     log_interval: int = 5
     timeout: int = 600
+
+    # config echo lb
+    echo_log_path: str = None
+    echo_log_server_info_path: str = None
+    echo_refresh_server_info_interval: float = 0.05
+    latency_lookuptable_path: str = None
+    energy_lookuptable_path: str = None
+
+    # workwaround for nixl
+    fake_transfer: bool = False
+    fake_transfer_v2: bool = False
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -19,6 +33,22 @@ class LBArgs:
             "--rust-lb",
             action="store_true",
             help="Use Rust load balancer",
+        )
+        parser.add_argument(
+            "--echo-lb",
+            action="store_true",
+            help="Use Echo load balancer",
+        )
+        parser.add_argument(
+            "--mp-echo-lb",
+            action="store_true",
+            help="Use Multi-process Echo load balancer",
+        )
+        parser.add_argument(
+            "--mp-workers",
+            type=int,
+            default=LBArgs.mp_workers,
+            help="Number of workers for multi-process load balancer (default: 4)",
         )
         parser.add_argument(
             "--host",
@@ -36,7 +66,7 @@ class LBArgs:
             "--policy",
             type=str,
             default=LBArgs.policy,
-            choices=["random", "po2"],
+            # choices=["random", "po2"],
             help=f"Policy to use for load balancing (default: {LBArgs.policy})",
         )
         parser.add_argument(
@@ -71,6 +101,48 @@ class LBArgs:
             default=LBArgs.timeout,
             help=f"Timeout in seconds (default: {LBArgs.timeout})",
         )
+        # workaround for nixl
+        parser.add_argument(
+            "--fake-transfer",
+            action="store_true",
+            help="Use fake transfer for Echo load balancer",
+        )
+        parser.add_argument(
+            "--fake-transfer-v2",
+            action="store_true",
+            help="Use fake transfer for Echo load balancer, but keep the real sequence order",
+        )
+        # for echo lb
+        parser.add_argument(
+            "--echo-log-path",
+            type=str,
+            default=LBArgs.echo_log_path,
+            help="Path to log file for Echo load balancer",
+        )
+        parser.add_argument(
+            "--echo-log-server-info-path",
+            type=str,
+            default=LBArgs.echo_log_server_info_path,
+            help="Path to log server info for Echo load balancer",
+        )
+        parser.add_argument(
+            "--echo-refresh-server-info-interval",
+            type=float,
+            default=LBArgs.echo_refresh_server_info_interval,
+            help="Interval to refresh server info for Echo load balancer (default: 0.05s)",
+        )
+        parser.add_argument(
+            "--latency-lookuptable-path",
+            type=str,
+            default=LBArgs.latency_lookuptable_path,
+            help="Path to latency lookup table for Echo load balancer",
+        )
+        parser.add_argument(
+            "--energy-lookuptable-path",
+            type=str,
+            default=LBArgs.energy_lookuptable_path,
+            help="Path to energy lookup table for Echo load balancer",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace) -> "LBArgs":
@@ -91,6 +163,7 @@ class LBArgs:
 
         return cls(
             rust_lb=args.rust_lb,
+            echo_lb=args.echo_lb,
             host=args.host,
             port=args.port,
             policy=args.policy,
@@ -98,13 +171,23 @@ class LBArgs:
             decode_infos=args.decode,
             log_interval=args.log_interval,
             timeout=args.timeout,
+            mp_workers=args.mp_workers,
+            # workaround for nixl
+            fake_transfer=args.fake_transfer,
+            fake_transfer_v2=args.fake_transfer_v2,
+            # config echo lb
+            echo_log_path=args.echo_log_path,
+            echo_log_server_info_path=args.echo_log_server_info_path,
+            echo_refresh_server_info_interval=args.echo_refresh_server_info_interval,
+            latency_lookuptable_path=args.latency_lookuptable_path,
+            energy_lookuptable_path=args.energy_lookuptable_path,
         )
 
-    def __post_init__(self):
-        if not self.rust_lb:
-            assert (
-                self.policy == "random"
-            ), "Only random policy is supported for Python load balancer"
+    # def __post_init__(self):
+    #     if not self.rust_lb:
+    #         assert (
+    #             self.policy == "random"
+    #         ), "Only random policy is supported for Python load balancer"
 
 
 def main():
@@ -127,6 +210,14 @@ def main():
             log_interval=lb_args.log_interval,
             timeout=lb_args.timeout,
         ).start()
+
+    elif lb_args.echo_lb:
+        from sglang.srt.disaggregation.mini_lb import PrefillConfig, run_echo_lb
+
+        prefill_configs = [
+            PrefillConfig(url, port) for url, port in lb_args.prefill_infos
+        ]
+        run_echo_lb(prefill_configs, lb_args)
     else:
         from sglang.srt.disaggregation.mini_lb import PrefillConfig, run
 

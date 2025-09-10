@@ -177,7 +177,7 @@ benchmark/llava_bench/mme_pack
 tmp*.txt
 
 # Plots
-*.png
+# *.png
 *.pdf
 
 # personnal
@@ -235,3 +235,7 @@ compile_commands.json
 Cargo.lock
 
 lmms-eval
+
+.vscode/
+.idea/
+.history/

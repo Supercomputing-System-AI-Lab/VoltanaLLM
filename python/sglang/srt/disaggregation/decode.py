@@ -20,8 +20,11 @@ Life cycle of a request in the decode server
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
+import pickle
+import time
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -29,6 +32,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+import zmq
 from torch.distributed import ProcessGroup
 
 from sglang.srt.disaggregation.base import BaseKVManager, BaseKVReceiver, KVPoll
@@ -45,7 +49,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce,
     prepare_abort,
 )
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch, ExtraBatchInfo
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import (
     KVCache,
@@ -687,6 +691,14 @@ class SchedulerDisaggregationDecodeMixin:
         self.last_batch_in_queue = False  # last batch is modified in-place, so we need another variable to track if it's extend
 
         while True:
+
+            if self.collect_extra_batch_info:
+                extra_batch_info = ExtraBatchInfo(
+                    iteration_counter = self.iteration_counter,
+                    timestamp_begin = time.perf_counter(),
+                )
+            self.iteration_counter += 1
+
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             # polling and allocating kv cache
@@ -694,6 +706,20 @@ class SchedulerDisaggregationDecodeMixin:
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
             last_batch_in_queue = False
+
+            if self.collect_extra_batch_info and (batch is not None):
+                batch.extra_batch_info = extra_batch_info
+                extra_batch_info.timestamp_after_schedule = time.perf_counter()
+                extra_batch_info.batch_size = len(batch.reqs)
+                extra_batch_info.num_total_computed_tokens_list = tuple(
+                    req.seqlen - 1 for req in batch.reqs
+                )
+                extra_batch_info.forward_mode = batch.forward_mode
+                if self.server_args.collect_iteration_energy:
+                    if self.server_args.num_forward_repeat:
+                        batch.num_forward_repeat = self.server_args.num_forward_repeat
+                    else:
+                        batch.num_forward_repeat = max(req.num_forward_repeat for req in batch.reqs)
 
             prepare_dp_attn_flag = (
                 self.server_args.enable_dp_attention
@@ -738,6 +764,11 @@ class SchedulerDisaggregationDecodeMixin:
                 if batch:
                     result_queue.append((batch.copy(), result))
                     last_batch_in_queue = True
+
+            # NOTE: send metrics to frequency manager only when the batch is not empty
+            if self.monitor_iteration_metrics and (self.pp_rank == 0 and self.attn_tp_rank == 0) and (batch is not None) and (not batch.forward_mode.is_extend()):
+                metrics = self.get_metrics_for_freq(batch)
+                self.send_to_freq_manager.send_pyobj(metrics, copy=False, flags=zmq.NOBLOCK, protocol=pickle.HIGHEST_PROTOCOL)
 
             # Process the results of the previous batch but skip if the last batch is extend
             if self.last_batch and self.last_batch_in_queue:

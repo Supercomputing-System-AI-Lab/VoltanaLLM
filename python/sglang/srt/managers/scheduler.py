@@ -20,6 +20,8 @@ import signal
 import sys
 import threading
 import time
+import pickle
+from multiprocessing import shared_memory
 from collections import defaultdict, deque
 from concurrent import futures
 from dataclasses import dataclass
@@ -28,6 +30,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple, Union
 
+import atomics
 import psutil
 import setproctitle
 import torch
@@ -82,6 +85,7 @@ from sglang.srt.managers.io_struct import (
     HealthCheckOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    MetricsForFreq,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
@@ -108,6 +112,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.mm_utils import init_embedding_cache
 from sglang.srt.managers.schedule_batch import (
+    ExtraBatchInfo,
     FINISH_ABORT,
     MultimodalInputs,
     Req,
@@ -160,7 +165,7 @@ logger = logging.getLogger(__name__)
 TEST_RETRACT = get_bool_env_var("SGLANG_TEST_RETRACT")
 RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
 GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
-
+VOLTANA_DEBUG = get_bool_env_var("VOLTANA_DEBUG", "false")
 
 @dataclass
 class GenerationBatchResult:
@@ -172,6 +177,8 @@ class GenerationBatchResult:
     bid: int
     can_run_cuda_graph: bool
 
+    timestamp_before_forward: Optional[float] = None
+    timestamp_after_forward: Optional[float] = None
 
 @dataclass
 class EmbeddingBatchResult:
@@ -215,6 +222,7 @@ class Scheduler(
         tp_rank: int,
         pp_rank: int,
         dp_rank: Optional[int],
+        **kwargs,
     ):
         # Parse args
         self.server_args = server_args
@@ -257,6 +265,9 @@ class Scheduler(
             )
             self.send_to_tokenizer = get_zmq_socket(
                 context, zmq.PUSH, port_args.tokenizer_ipc_name, False
+            )
+            self.send_to_freq_manager = get_zmq_socket(
+                context, zmq.PUSH, port_args.metric_monitor_ipc_name, False
             )
 
             if server_args.skip_tokenizer_init:
@@ -508,6 +519,30 @@ class Scheduler(
         )
         self.init_disaggregation()
 
+        # For tile scheduler
+        self.last_total_bs: int = 0
+
+        # for profiling
+        self.collect_extra_batch_info = server_args.collect_extra_batch_info
+        self.collect_iteration_energy = server_args.collect_iteration_energy
+        self.monitor_iteration_metrics = server_args.monitor_iteration_metrics
+        self.num_forward_repeat = server_args.num_forward_repeat
+        self.iteration_counter: int = 0
+
+        # atomics for gpu
+        self.gpu_freq_shm = shared_memory.SharedMemory(name=kwargs["gpu_freq_shm_name"])
+        self.gpu_power_shm = shared_memory.SharedMemory(name=kwargs["gpu_power_shm_name"])
+        self.gpu_energy_shm = shared_memory.SharedMemory(name=kwargs["gpu_energy_shm_name"])
+        self.gpu_freq_buf = self.gpu_freq_shm.buf[:4]
+        self.gpu_power_buf = self.gpu_power_shm.buf[:4]
+        self.gpu_energy_buf = self.gpu_energy_shm.buf[:4]
+
+        # running metrics
+        self.last_ttft: float = None
+        self.last_itl: float = None
+        self.last_bs: int = 0
+        self.last_running_tokens: int = 0
+
     def maybe_sleep_on_idle(self):
         if self.idle_sleeper is not None:
             self.idle_sleeper.maybe_sleep()
@@ -700,11 +735,50 @@ class Scheduler(
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
+
+            # init extra batch info
+            if self.collect_extra_batch_info:
+                extra_batch_info = ExtraBatchInfo(
+                    iteration_counter = self.iteration_counter,
+                    timestamp_begin = time.perf_counter(),
+                )
+            self.iteration_counter += 1
+
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
+
+            # update extra batch info after scheduling
+            if self.collect_extra_batch_info and (batch is not None):
+                batch.extra_batch_info = extra_batch_info
+                extra_batch_info.timestamps_arrival = [
+                    req.created_time for req in batch.reqs
+                ]
+                extra_batch_info.timestamp_after_schedule = time.perf_counter()
+                extra_batch_info.batch_size = len(batch.reqs)
+                extra_batch_info.num_total_computed_tokens_list = tuple(
+                    len(req.prefix_indices) for req in batch.reqs
+                )
+                extra_batch_info.num_total_computing_tokens_list = tuple(
+                    req.extend_input_len for req in batch.reqs
+                )
+                extra_batch_info.forward_mode = batch.forward_mode
+                if self.collect_iteration_energy:
+                    if self.num_forward_repeat:  # overwrite from API
+                        batch.num_forward_repeat = self.num_forward_repeat
+                    else:
+                        batch.num_forward_repeat = max(req.num_forward_repeat for req in batch.reqs)
+
+            # send system load metrics for frequency manager
+            if self.monitor_iteration_metrics \
+                and (self.pp_rank == 0 and self.attn_tp_rank == 0) \
+                and (batch is not None) \
+                and batch.forward_mode.is_extend():
+
+                metrics = self.get_metrics_for_freq(batch)
+                self.send_to_freq_manager.send_pyobj(metrics, copy=False, flags=zmq.NOBLOCK, protocol=pickle.HIGHEST_PROTOCOL)
 
             if batch:
                 result = self.run_batch(batch)
@@ -723,11 +797,41 @@ class Scheduler(
         self.result_queue = deque()
 
         while True:
+
+            # init extra batch info
+            if self.collect_extra_batch_info:
+                extra_batch_info = ExtraBatchInfo(
+                    iteration_counter = self.iteration_counter,
+                    timestamp_begin = time.perf_counter(),
+                )
+            self.iteration_counter += 1
+
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
+
+            # update extra batch info after scheduling
+            if self.collect_extra_batch_info and (batch is not None):
+                batch.extra_batch_info = extra_batch_info
+                extra_batch_info.timestamps_arrival = [
+                    req.created_time for req in batch.reqs
+                ]
+                extra_batch_info.timestamp_after_schedule = time.perf_counter()
+                extra_batch_info.batch_size = len(batch.reqs)
+                extra_batch_info.num_total_computed_tokens_list = tuple(
+                    len(req.prefix_indices) for req in batch.reqs
+                )
+                extra_batch_info.num_total_computing_tokens_list = tuple(
+                    req.extend_input_len for req in batch.reqs
+                )
+                extra_batch_info.forward_mode = batch.forward_mode
+                if self.collect_iteration_energy:
+                    if self.num_forward_repeat:  # overwrite from API
+                        batch.num_forward_repeat = self.num_forward_repeat
+                    else:
+                        batch.num_forward_repeat = max(req.num_forward_repeat for req in batch.reqs)
 
             if batch:
                 batch.launch_done = threading.Event()
@@ -877,7 +981,10 @@ class Scheduler(
                         recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
                     except zmq.ZMQError:
                         break
-                    recv_reqs.append(recv_req)
+                    if isinstance(recv_req, list):
+                        recv_reqs.extend(recv_req)
+                    else:
+                        recv_reqs.append(recv_req)
 
                 while True:
                     try:
@@ -999,6 +1106,8 @@ class Scheduler(
                 bootstrap_port=recv_req.bootstrap_port,
                 bootstrap_room=recv_req.bootstrap_room,
                 data_parallel_rank=recv_req.data_parallel_rank,
+                created_time=recv_req.created_time,
+                num_forward_repeat=recv_req.num_forward_repeat,
             )
             req.tokenizer = self.tokenizer
 
@@ -1209,7 +1318,7 @@ class Scheduler(
             f"#new-seq: {num_new_seq}, "
             f"#new-token: {adder.log_input_tokens}, "
             f"#cached-token: {adder.log_hit_tokens}, "
-            f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
+            f"token usage: {num_used / self.max_total_num_tokens:.5f}, "
         )
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -1265,7 +1374,7 @@ class Scheduler(
             f"Decode batch. "
             f"#running-req: {num_running_reqs}, "
             f"#token: {num_used}, "
-            f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
+            f"token usage: {num_used / self.max_total_num_tokens:.5f}, "
         )
 
         if self.spec_algorithm.is_none():
@@ -2000,6 +2109,98 @@ class Scheduler(
 
         return load
 
+    def get_bs(self) -> int:
+        if self.cur_batch:
+            if self.disaggregation_mode == DisaggregationMode.DECODE:
+                if not self.cur_batch.forward_mode.is_extend():
+                    self.last_bs = len(self.cur_batch.reqs)
+            else:
+                if self.cur_batch.forward_mode.is_extend():
+                    self.last_bs = len(self.cur_batch.reqs)
+            if VOLTANA_DEBUG:
+                logger.info(f"Scheduler.get_bs: {self.last_bs=}, ")
+            return self.last_bs
+        else:
+            if VOLTANA_DEBUG:
+                logger.info("Scheduler.get_bs: No current batch, returning 0")
+            return 0
+
+    def get_total_bs(self) -> int:
+        if self.running_batch and (self.running_batch.forward_mode is not None):
+            if self.disaggregation_mode == DisaggregationMode.DECODE:
+                if not self.running_batch.forward_mode.is_extend():
+                    self.last_total_bs = len(self.running_batch.reqs)
+            else:
+                if self.running_batch.forward_mode.is_extend():
+                    self.last_total_bs = len(self.running_batch.reqs)
+            bs = self.last_total_bs
+        else:
+            bs = 0
+
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            bs += len(self.disagg_decode_prealloc_queue.queue) + \
+                  len(self.disagg_decode_transfer_queue.queue) + \
+                  len(self.waiting_queue)
+        elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+            bs += len(self.disagg_prefill_bootstrap_queue.queue) + \
+                  len(self.disagg_prefill_inflight_queue) + \
+                  len(self.waiting_queue)
+
+        return bs
+
+    def get_num_running_tokens(self) -> int:
+        if self.cur_batch:
+            if self.disaggregation_mode == DisaggregationMode.DECODE:
+                if not self.cur_batch.forward_mode.is_extend():
+                    self.last_running_tokens = sum(req.seqlen - 1 for req in self.cur_batch.reqs)
+            else:
+                if self.cur_batch.forward_mode.is_extend():
+                    self.last_running_tokens = sum(req.extend_input_len for req in self.cur_batch.reqs)
+
+            return self.last_running_tokens
+        else:
+            return 0
+
+    def get_metrics_for_freq(self, batch: ScheduleBatch) -> MetricsForFreq:
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            return MetricsForFreq(
+                timestamp=time.perf_counter(),
+                bs=self.get_bs(),
+                total_bs=self.get_total_bs(),
+                num_running_tokens=self.get_num_running_tokens(),
+                len_waiting_queue=len(self.waiting_queue),
+                # decode
+                len_decode_prealloc_queue=len(self.disagg_decode_prealloc_queue.queue),
+                len_decode_transfer_queue=len(self.disagg_decode_transfer_queue.queue),
+                len_decode_retracted_queue=len(self.disagg_decode_prealloc_queue.retracted_queue),
+                last_itl=self.last_itl,
+            )
+        elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+            return MetricsForFreq(
+                timestamp=time.perf_counter(),
+                bs=self.get_bs(),
+                total_bs=self.get_total_bs(),
+                num_running_tokens=self.get_num_running_tokens(),
+                len_waiting_queue=len(self.waiting_queue),
+                # prefill
+                len_prefill_bootstrap_queue=len(self.disagg_prefill_bootstrap_queue.queue),
+                len_prefill_inflight_queue=len(self.disagg_prefill_inflight_queue),
+                last_ttft=self.last_ttft,
+                ttft_slo_offsets=[
+                    req.scheduled_time - req.created_time for req in batch.reqs
+                ],
+            )
+        else:
+            return MetricsForFreq(
+                timestamp=time.perf_counter(),
+                bs=self.get_bs(),
+                total_bs=self.get_total_bs(),
+                num_running_tokens=self.get_num_running_tokens(),
+                len_waiting_queue=len(self.waiting_queue),
+                # prefill
+                last_ttft=self.last_ttft,
+            )
+
     def get_internal_state(self, recv_req: GetInternalStateReq):
         ret = dict(global_server_args_dict)
         ret["last_gen_throughput"] = self.last_gen_throughput
@@ -2010,7 +2211,50 @@ class Scheduler(
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.step_time_dict
 
-        ret["load"] = self.get_load()
+        ret.update({
+            "is_prefill": self.disaggregation_mode == DisaggregationMode.PREFILL,
+            "time": time.perf_counter(),
+            "load": self.get_load(),
+            "bs": self.get_bs(),
+            "bs_total": self.get_total_bs(),
+            "num_running_tokens": self.get_num_running_tokens(),
+            "len_waiting_queue": len(self.waiting_queue),
+        })
+
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            last_ttft = 0
+            if self.get_bs() != 0:
+                last_ttft = self.last_ttft
+            ret.update({
+                "last_ttft": last_ttft,
+                "last_itl": 0,
+                "len_prefill_bootstrap_queue": len(self.disagg_prefill_bootstrap_queue.queue),
+                "len_prefill_inflight_queue": len(self.disagg_prefill_inflight_queue),
+                "len_decode_prealloc_queue": 0,
+                "len_decode_transfer_queue": 0,
+                "len_decode_retracted_queue": 0,
+            })
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            last_itl = 0
+            if self.get_bs() != 0:
+                last_itl = self.last_itl
+            ret.update({
+                "last_ttft": 0,
+                "last_itl": last_itl,
+                "len_prefill_bootstrap_queue": 0,
+                "len_prefill_inflight_queue": 0,
+                "len_decode_prealloc_queue": len(self.disagg_decode_prealloc_queue.queue),
+                "len_decode_transfer_queue": len(self.disagg_decode_transfer_queue.queue),
+                "len_decode_retracted_queue": len(self.disagg_decode_prealloc_queue.retracted_queue),
+            })
+
+        with atomics.atomicview(buffer=self.gpu_freq_buf, atype=atomics.UINT) as a:
+            ret["gpu_freq"] = a.load()
+        with atomics.atomicview(buffer=self.gpu_power_buf, atype=atomics.UINT) as a:
+            ret["gpu_power"] = a.load()
+        with atomics.atomicview(buffer=self.gpu_energy_buf, atype=atomics.UINT) as a:
+            ret["gpu_energy"] = a.load()
+        ret["slo"] = self.server_args.freq_manager_slo
 
         return GetInternalStateReqOutput(internal_state=ret)
 
@@ -2509,6 +2753,7 @@ def run_scheduler_process(
     pp_rank: int,
     dp_rank: Optional[int],
     pipe_writer,
+    **kwargs,
 ):
     # Generate the prefix
     prefix = ""
@@ -2543,7 +2788,7 @@ def run_scheduler_process(
     init_embedding_cache(embedding_cache_size * 1024 * 1024)
     # Create a scheduler and run the event loop
     try:
-        scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank, pp_rank, dp_rank)
+        scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank, pp_rank, dp_rank, **kwargs)
         pipe_writer.send(
             {
                 "status": "ready",

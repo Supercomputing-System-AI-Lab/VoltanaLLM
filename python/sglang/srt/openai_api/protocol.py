@@ -19,6 +19,7 @@ from typing import Dict, List, Optional, Union
 from pydantic import BaseModel, Field, model_serializer, root_validator
 from typing_extensions import Literal
 
+from sglang.srt.managers.schedule_batch import ExtraBatchInfo
 
 class ModelCard(BaseModel):
     """Model cards."""
@@ -81,6 +82,8 @@ class UsageInfo(BaseModel):
 
 class StreamOptions(BaseModel):
     include_usage: Optional[bool] = False
+    # include batch info of engine for latency modeling
+    include_extra_batch_info: Optional[bool] = False
 
 
 class JsonSchemaResponseFormat(BaseModel):
@@ -189,6 +192,8 @@ class CompletionRequest(BaseModel):
     bootstrap_port: Optional[int] = None
     bootstrap_room: Optional[int] = None
 
+    # The repeat number of forward pass
+    num_forward_repeat: Optional[int] = 1
 
 class CompletionResponseChoice(BaseModel):
     index: int
@@ -232,6 +237,10 @@ class CompletionStreamResponse(BaseModel):
     model: str
     choices: List[CompletionResponseStreamChoice]
     usage: Optional[UsageInfo] = None
+    # information of the batch that generates this token
+    extra_batch_info: Optional[ExtraBatchInfo] = None
+    # timestamp of when the token is generated
+    cur_token_time: Optional[float] = None
 
 
 class ChatCompletionMessageContentTextPart(BaseModel):

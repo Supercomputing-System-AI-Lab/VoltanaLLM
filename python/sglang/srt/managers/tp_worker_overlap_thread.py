@@ -13,6 +13,7 @@
 # ==============================================================================
 """A tensor parallel worker."""
 
+import time
 import dataclasses
 import logging
 import signal
@@ -22,6 +23,7 @@ from typing import Optional, Tuple
 
 import psutil
 import torch
+import pynvml
 
 from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
@@ -33,10 +35,13 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import DynamicGradMode, get_compiler_backend
+from sglang.srt.utils import DynamicGradMode, get_compiler_backend, get_bool_env_var
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
+
+
+VOLTANA_DEBUG = get_bool_env_var("VOLTANA_DEBUG", "false")
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend())
@@ -61,6 +66,7 @@ class TpModelWorkerClient:
         nccl_port: int,
     ):
         # Load the model
+        self.server_args = server_args
         self.worker = TpModelWorker(
             server_args, gpu_id, tp_rank, pp_rank, dp_rank, nccl_port
         )
@@ -74,6 +80,10 @@ class TpModelWorkerClient:
         self.future_token_ids_map = torch.empty(
             (self.max_running_requests * 5,), dtype=torch.int64, device=self.device
         )
+
+        # if collect time/energy info of model execution
+        self.collect_extra_batch_info = server_args.collect_extra_batch_info
+        self.collect_iteration_energy = server_args.collect_iteration_energy
 
         # Launch threads
         self.input_queue = Queue()
@@ -126,12 +136,19 @@ class TpModelWorkerClient:
         batch_pt = 0
         batch_lists = [None] * 2
 
+        if self.collect_extra_batch_info and self.collect_iteration_energy:
+            pynvml.nvmlInit()
+            nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(self.gpu_id)
+
         while True:
             model_worker_batch, future_token_ids_ct, sync_event = self.input_queue.get()
             if not model_worker_batch:
                 break
 
             sync_event.wait()
+
+            if self.collect_extra_batch_info:
+                timestamp_before_worker_iteration = time.perf_counter()
 
             # Keep a reference of model_worker_batch by storing it into a list.
             # Otherwise, the tensor members of model_worker_batch will be released
@@ -146,12 +163,31 @@ class TpModelWorkerClient:
             input_ids = model_worker_batch.input_ids
             resolve_future_token_ids(input_ids, self.future_token_ids_map)
 
+            if self.collect_extra_batch_info:
+                if self.collect_iteration_energy:
+                    energy_before_forward = pynvml.nvmlDeviceGetTotalEnergyConsumption(nvml_handle)
+                timestamp_before_forward = time.perf_counter()
+
             # Run forward
-            logits_output, next_token_ids, can_run_cuda_graph = (
-                self.worker.forward_batch_generation(
-                    model_worker_batch, model_worker_batch.launch_done
+            num_forward_repeat = model_worker_batch.num_forward_repeat
+            if num_forward_repeat is None:
+                num_forward_repeat = 1
+            if VOLTANA_DEBUG:
+                logger.info(f"num_forward_repeat: {num_forward_repeat}")
+            for _ in range(num_forward_repeat):
+                logits_output, next_token_ids, can_run_cuda_graph = (
+                    self.worker.forward_batch_generation(
+                        model_worker_batch, model_worker_batch.launch_done
+                    )
                 )
-            )
+
+            if self.collect_extra_batch_info:
+                timestamp_after_forward = time.perf_counter()
+                logits_output.timestamp_before_forward = timestamp_before_forward
+                logits_output.timestamp_after_forward = timestamp_after_forward
+                if self.collect_iteration_energy:
+                    energy_after_forward = pynvml.nvmlDeviceGetTotalEnergyConsumption(nvml_handle)
+                    logits_output.energy_forward = energy_after_forward - energy_before_forward
 
             # Update the future token ids map
             bs = len(model_worker_batch.seq_lens)
@@ -174,6 +210,11 @@ class TpModelWorkerClient:
                 )
             next_token_ids = next_token_ids.to("cpu", non_blocking=True)
             copy_done.record()
+
+            if self.collect_extra_batch_info:
+                logits_output.timestamp_before_worker_iteration = timestamp_before_worker_iteration
+                logits_output.timestamp_after_worker_iteration = time.perf_counter()
+                logits_output.num_forward_repeat = num_forward_repeat
 
             self.output_queue.put(
                 (copy_done, logits_output, next_token_ids, can_run_cuda_graph)

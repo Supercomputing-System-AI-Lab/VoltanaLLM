@@ -234,6 +234,35 @@ class ServerArgs:
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     pdlb_url: Optional[str] = None
 
+    # Bug fixing
+    force_cuda_graph_prefill: bool = False
+    non_stream_return_all: bool = False
+
+    # For profiling
+    collect_extra_batch_info: bool = False
+    collect_iteration_energy: bool = False
+    monitor_iteration_metrics: bool = False
+    num_forward_repeat: Optional[int] = None   # override the value passed by API
+
+    # For energy monitor
+    enable_energy_monitor: bool = False
+    energy_monitor_interval: float = 0
+
+    # For frequency manager
+    enable_freq_manager: bool = False
+    freq_manager_dummy_run: bool = False
+    freq_manager_interval: float = 0
+    freq_manager_latency_lookup_table_path: Optional[str] = None
+    freq_manager_energy_lookup_table_path: Optional[str] = None
+    freq_manager_f_list: Optional[List[int]] = None
+    freq_manager_slo: Optional[float] = None
+    freq_manager_slo_margin: Optional[float] = None
+    freq_manager_tps_threshold: Optional[float] = None
+    freq_manager_tps_window: Optional[float] = None
+    freq_manager_rps_threshold: Optional[float] = None
+    freq_manager_rps_window: Optional[float] = None
+    freq_manager_use_bs_total: bool = False
+
     def __post_init__(self):
         # Expert parallelism
         if self.enable_ep_moe:
@@ -527,8 +556,11 @@ class ServerArgs:
             self.disaggregation_prefill_pp = self.pp_size
             self.validate_disagg_tp_size(self.tp_size, self.disaggregation_decode_tp)
 
-            self.disable_cuda_graph = True
-            logger.warning("Cuda graph is disabled for prefill server")
+            if self.force_cuda_graph_prefill:
+                logger.warning("Cuda graph is force enabled for prefill server")
+            else:
+                self.disable_cuda_graph = True
+                logger.warning("Cuda graph is disabled for prefill server")
 
         os.environ["SGLANG_ENABLE_TORCH_COMPILE"] = (
             "1" if self.enable_torch_compile else "0"
@@ -1529,7 +1561,7 @@ class ServerArgs:
             "--disaggregation-transfer-backend",
             type=str,
             default=ServerArgs.disaggregation_transfer_backend,
-            choices=["mooncake", "nixl"],
+            choices=["mooncake", "nixl", "fake", "fakenixl"],
             help="The backend for disaggregation transfer. Default is mooncake.",
         )
         parser.add_argument(
@@ -1575,6 +1607,141 @@ class ServerArgs:
             type=str,
             default=None,
             help="The URL of the PD disaggregation load balancer. If set, the prefill/decode server will register with the load balancer.",
+        )
+
+        # Bug fixes
+        parser.add_argument(
+            "--force-cuda-graph-prefill",
+            action="store_true",
+            default=ServerArgs.force_cuda_graph_prefill,
+            help="Force using cuda graph for prefill instance.",
+        )
+        parser.add_argument(
+            "--non-stream-return-all",
+            action="store_true",
+            default=ServerArgs.non_stream_return_all,
+            help="Return information of all iterations in non-stream mode.",
+        )
+
+        # For profiling
+        parser.add_argument(
+            "--collect-extra-batch-info",
+            action="store_true",
+            default=ServerArgs.collect_extra_batch_info,
+            help="Collect extra batch info for profiling.",
+        )
+        parser.add_argument(
+            "--collect-iteration-energy",
+            action="store_true",
+            default=ServerArgs.collect_iteration_energy,
+            help="Collect energy consumption for each iteration (this is time consuming).",
+        )
+        parser.add_argument(
+            "--monitor-iteration-metrics",
+            action="store_true",
+            default=ServerArgs.monitor_iteration_metrics,
+            help="Monitor system load metrics for frequency manager.",
+        )
+        parser.add_argument(
+            "--num-forward-repeat",
+            type=int,
+            default=ServerArgs.num_forward_repeat,
+            help="Number of forward repeat for energy measurement.",
+        )
+
+        # Energy Monitor
+        parser.add_argument(
+            "--enable-energy-monitor",
+            action="store_true",
+            default=ServerArgs.enable_energy_monitor,
+            help="Export energy consumption metrics (in joules) via API.",
+        )
+        parser.add_argument(
+            "--energy-monitor-interval",
+            type=float,
+            default=ServerArgs.energy_monitor_interval,
+            help="The interval (in seconds) to sample energy consumption.",
+        )
+
+        # Freq Manager
+        parser.add_argument(
+            "--enable-freq-manager",
+            action="store_true",
+            default=ServerArgs.enable_freq_manager,
+            help="Enable the frequency manager.",
+        )
+        parser.add_argument(
+            "--freq-manager-dummy-run",
+            action="store_true",
+            default=ServerArgs.freq_manager_dummy_run,
+            help="Skip frequency setting of frequency manager.",
+        )
+        parser.add_argument(
+            "--freq-manager-interval",
+            type=float,
+            default=ServerArgs.freq_manager_interval,
+            help="The interval (in seconds) for frequency manager to adjust GPU frequency.",
+        )
+        parser.add_argument(
+            "--freq-manager-latency-lookup-table-path",
+            type=str,
+            default=ServerArgs.freq_manager_latency_lookup_table_path,
+            help="The path to the latency lookup table for frequency manager.",
+        )
+        parser.add_argument(
+            "--freq-manager-energy-lookup-table-path",
+            type=str,
+            default=ServerArgs.freq_manager_energy_lookup_table_path,
+            help="The path to the energy lookup table for frequency manager.",
+        )
+        parser.add_argument(
+            "--freq-manager-f-list",
+            type=int,
+            nargs="+",
+            default=ServerArgs.freq_manager_f_list,
+            help="The list of frequencies (in MHz) for frequency manager to choose from.",
+        )
+        parser.add_argument(
+            "--freq-manager-slo",
+            type=float,
+            default=ServerArgs.freq_manager_slo,
+            help="The SLO (in ms) for frequency manager to meet.",
+        )
+        parser.add_argument(
+            "--freq-manager-slo-margin",
+            type=float,
+            default=ServerArgs.freq_manager_slo_margin,
+            help="The SLO margin (%).",
+        )
+        parser.add_argument(
+            "--freq-manager-tps-threshold",
+            type=float,
+            default=ServerArgs.freq_manager_tps_threshold,
+            help="The TPS threshold for frequency manager to increase frequency.",
+        )
+        parser.add_argument(
+            "--freq-manager-rps-threshold",
+            type=float,
+            default=ServerArgs.freq_manager_rps_threshold,
+            help="The RPS threshold for frequency manager to increase frequency.",
+        )
+        parser.add_argument(
+            "--freq-manager-tps-window",
+            type=float,
+            default=ServerArgs.freq_manager_tps_window,
+            help="The time window (in seconds) to calculate TPS.",
+        )
+        parser.add_argument(
+            "--freq-manager-rps-window",
+            type=float,
+            default=ServerArgs.freq_manager_rps_window,
+            help="The time window (in seconds) to calculate RPS.",
+        )
+        parser.add_argument(
+            "--freq-manager-use-bs-total",
+            action="store_true",
+            default=ServerArgs.freq_manager_use_bs_total,
+            help="Use total batch size (including waiting) in frequency manager.",
         )
 
     @classmethod
@@ -1656,6 +1823,10 @@ class PortArgs:
     scheduler_input_ipc_name: str
     # The ipc filename for detokenizer to receive inputs from scheduler (zmq)
     detokenizer_ipc_name: str
+    # The ipc filename for freq manager to receive metrics from scheduler (zmq)
+    metric_monitor_ipc_name: str
+    # The ipc filename for control freq manager (zmq)
+    control_freq_manager_ipc_name: str
 
     # The port for nccl initialization (torch.dist)
     nccl_port: int
@@ -1680,6 +1851,8 @@ class PortArgs:
                 tokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 scheduler_input_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 detokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
+                metric_monitor_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
+                control_freq_manager_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 nccl_port=port,
                 rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
             )
@@ -1710,6 +1883,8 @@ class PortArgs:
                 tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
                 scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",
                 detokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base + 1}",
+                metric_monitor_ipc_name=f"tcp://{dist_init_host}:{port_base + 3}",
+                control_freq_manager_ipc_name=f"tcp://{dist_init_host}:{port_base + 4}",
                 nccl_port=port,
                 rpc_ipc_name=f"tcp://{dist_init_host}:{port_base + 2}",
             )

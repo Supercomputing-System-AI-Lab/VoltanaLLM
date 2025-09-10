@@ -22,7 +22,9 @@ import dataclasses
 import json
 import logging
 import multiprocessing as multiprocessing
+from multiprocessing import shared_memory
 import os
+import pickle
 import threading
 import time
 from http import HTTPStatus
@@ -33,6 +35,8 @@ setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
 from contextlib import asynccontextmanager
 
+import zmq
+import atomics
 import numpy as np
 import orjson
 import requests
@@ -62,8 +66,11 @@ from sglang.srt.managers.io_struct import (
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     SeparateReasoningReqInput,
+    SetFreqManagerReq,
+    SetFreqReq,
     SetInternalStateReq,
     SlowDownReqInput,
+    UnsetFreqReq,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
@@ -218,18 +225,28 @@ async def get_model_info():
         "tokenizer_path": _global_state.tokenizer_manager.server_args.tokenizer_path,
         "is_generation": _global_state.tokenizer_manager.is_generation,
     }
-    return result
+    return ORJSONResponse(
+        result,
+        status_code=HTTPStatus.OK,
+    )
 
 
 @app.get("/get_server_info")
 async def get_server_info():
     internal_states = await _global_state.tokenizer_manager.get_internal_state()
-    return {
+    for state in internal_states:
+        if "gpu_freq" in state:
+            state["freq"] = state["gpu_freq"]
+    result = {
         **dataclasses.asdict(_global_state.tokenizer_manager.server_args),
         **_global_state.scheduler_info,
         "internal_states": internal_states,
         "version": __version__,
     }
+    return ORJSONResponse(
+        result,
+        status_code=HTTPStatus.OK,
+    )
 
 
 @app.get("/get_load")
@@ -243,6 +260,28 @@ async def set_internal_state(obj: SetInternalStateReq, request: Request):
     return res
 
 
+@app.post("/set_freq_manager_state")
+async def set_freq_manager_state(obj: SetFreqManagerReq, request: Request):
+    zmq_socket = _global_state.tokenizer_manager.send_to_freq_manager_settings
+    zmq_socket.send_pyobj(obj, copy=False, flags=zmq.NOBLOCK, protocol=pickle.HIGHEST_PROTOCOL)
+    return Response(status_code=200)
+
+
+@app.post("/set_freq")
+async def set_freq(obj: SetFreqReq, request: Request):
+    zmq_socket = _global_state.tokenizer_manager.send_to_freq_manager_settings
+    zmq_socket.send_pyobj(obj, copy=False, flags=zmq.NOBLOCK, protocol=pickle.HIGHEST_PROTOCOL)
+    return Response(status_code=200)
+
+
+@app.post("/unset_freq")
+async def unset_freq():
+    zmq_socket = _global_state.tokenizer_manager.send_to_freq_manager_settings
+    obj = UnsetFreqReq()
+    zmq_socket.send_pyobj(obj, copy=False, flags=zmq.NOBLOCK, protocol=pickle.HIGHEST_PROTOCOL)
+    return Response(status_code=200)
+
+
 # fastapi implicitly converts json in the request to obj (dataclass)
 @app.api_route("/generate", methods=["POST", "PUT"])
 async def generate_request(obj: GenerateReqInput, request: Request):
@@ -251,9 +290,29 @@ async def generate_request(obj: GenerateReqInput, request: Request):
 
         async def stream_results() -> AsyncIterator[bytes]:
             try:
+                returned_text_len = 0
                 async for out in _global_state.tokenizer_manager.generate_request(
                     obj, request
                 ):
+
+                    # NOTE: return just one token each time
+
+                    meta_info = out.get("meta_info", {})
+
+                    extra_batch_info = meta_info.pop("extra_batch_info", None)
+                    if (obj.stream_options is not None) \
+                        and obj.stream_options.include_extra_batch_info:
+                        out["extra_batch_info"] = extra_batch_info
+
+                    cur_token_time = meta_info.pop("cur_token_time", None)
+                    if cur_token_time is None:
+                        cur_token_time = time.perf_counter()
+                    out["cur_token_time"] = cur_token_time
+
+                    new_token = out["text"][returned_text_len:]
+                    returned_text_len = len(out["text"])
+                    out["text"] = new_token
+
                     yield b"data: " + orjson.dumps(
                         out, option=orjson.OPT_NON_STR_KEYS
                     ) + b"\n\n"
@@ -764,7 +823,22 @@ def launch_server(
     1. The HTTP server, Engine, and TokenizerManager both run in the main process.
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
-    tokenizer_manager, scheduler_info = _launch_subprocesses(server_args=server_args)
+
+    gpu_freq_shm = shared_memory.SharedMemory(create=True, size=4)
+    gpu_power_shm = shared_memory.SharedMemory(create=True, size=4)
+    gpu_energy_shm = shared_memory.SharedMemory(create=True, size=4)
+    app.gpu_freq_buf = gpu_freq_shm.buf[:4]
+    app.gpu_power_buf = gpu_power_shm.buf[:4]
+    app.gpu_energy_buf = gpu_energy_shm.buf[:4]
+    with atomics.atomicview(buffer=app.gpu_freq_buf, atype=atomics.UINT) as a:
+        a.store(0)
+
+    tokenizer_manager, scheduler_info = _launch_subprocesses(
+        server_args=server_args,
+        gpu_freq_shm_name=gpu_freq_shm.name,
+        gpu_power_shm_name=gpu_power_shm.name,
+        gpu_energy_shm_name=gpu_energy_shm.name,
+    )
     set_global_state(
         _GlobalState(
             tokenizer_manager=tokenizer_manager,
@@ -804,7 +878,8 @@ def launch_server(
             host=server_args.host,
             port=server_args.port,
             log_level=server_args.log_level_http or server_args.log_level,
-            timeout_keep_alive=5,
+            timeout_keep_alive=3600,
+            backlog=100000,
             loop="uvloop",
         )
     finally:
@@ -878,7 +953,7 @@ def _wait_and_warmup(
                 url + request_name,
                 json=json_data,
                 headers=headers,
-                timeout=600,
+                timeout=60 * 60 * 24,
             )
             assert res.status_code == 200, f"{res}"
         else:

@@ -76,6 +76,14 @@ class LogitsProcessorOutput:
     input_token_ids_logprobs_val: Optional[List] = None
     input_token_ids_logprobs_idx: Optional[List] = None
 
+    # timestamps for profiling of model execution
+    timestamp_before_forward: Optional[float] = None
+    timestamp_after_forward: Optional[float] = None
+    timestamp_before_worker_iteration: Optional[float] = None
+    timestamp_after_worker_iteration: Optional[float] = None
+
+    num_forward_repeat: int = 1 # number of forward repeats in this iteration
+    energy_forward: Optional[float] = None  # energy consumed in forward pass (mJ)
 
 @dataclasses.dataclass
 class LogitsMetadata:

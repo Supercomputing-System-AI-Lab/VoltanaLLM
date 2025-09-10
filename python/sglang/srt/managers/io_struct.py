@@ -17,6 +17,8 @@ processes (TokenizerManager, DetokenizerManager, Controller).
 """
 
 import copy
+import msgspec
+import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
@@ -30,7 +32,8 @@ if TYPE_CHECKING:
 else:
     Image = Any
 
-from sglang.srt.managers.schedule_batch import BaseFinishReason
+from sglang.srt.managers.schedule_batch import BaseFinishReason, ExtraBatchInfo
+from sglang.srt.openai_api.protocol import StreamOptions
 from sglang.srt.sampling.sampling_params import SamplingParams
 
 
@@ -108,6 +111,12 @@ class GenerateReqInput:
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
+
+    # openai stream options
+    stream_options: Optional[StreamOptions] = None
+
+    # Number of times to repeat the forward pass.
+    num_forward_repeat: Optional[int] = 1
 
     def contains_mm_input(self) -> bool:
         return has_valid_data(self.image_data) or has_valid_data(self.audio_data)
@@ -477,6 +486,11 @@ class TokenizedGenerateReqInput:
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
 
+    # Number of times to repeat the forward pass.
+    num_forward_repeat: int = 1
+
+    # The timestamp when this request is created
+    created_time: float = field(default_factory=time.perf_counter)
 
 @dataclass
 class EmbeddingReqInput:
@@ -641,6 +655,11 @@ class BatchTokenIDOut:
     # Hidden states
     output_hidden_states: List[List[float]]
 
+    # token generation time in the scheduler
+    cur_token_times: List[float]
+
+    # stats of engine iteration
+    extra_batch_info: Optional[ExtraBatchInfo] = None
 
 @dataclass
 class BatchMultimodalDecodeReq:
@@ -688,6 +707,11 @@ class BatchStrOut:
     # Hidden states
     output_hidden_states: List[List[float]]
 
+    # token generation time in the scheduler
+    cur_token_times: List[float]
+
+    # stats of engine iteration
+    extra_batch_info: Optional[ExtraBatchInfo] = None
 
 @dataclass
 class BatchMultimodalOut:
@@ -856,9 +880,56 @@ class GetInternalStateReqOutput:
     internal_state: Dict[Any, Any]
 
 
+# Information provided for frequency manager
+# @dataclass
+class MetricsForFreq(msgspec.Struct, gc=False):
+    timestamp: float
+    bs: int  # running batch size
+    total_bs: int  # including requests not in running
+    num_running_tokens: int
+    len_waiting_queue: int
+    # prefill
+    len_prefill_bootstrap_queue: int = None
+    len_prefill_inflight_queue: int = None
+    ttft_slo_offsets: List[float] = None
+    last_ttft: float = None
+    # decode
+    len_decode_prealloc_queue: int = None
+    len_decode_transfer_queue: int = None
+    len_decode_retracted_queue: int = None
+    last_itl: float = None
+
+
 @dataclass
 class SetInternalStateReq:
     server_args: Dict[str, Any]
+
+
+@dataclass
+class SetFreqManagerReq:
+    enabled: Optional[bool] = None
+    dummy_run: Optional[bool] = None
+    interval: Optional[float] = None
+    latency_lookup_table_path: Optional[str] = None
+    energy_lookup_table_path: Optional[str] = None
+    f_list: Optional[List[int]] = None
+    slo: Optional[float] = None
+    slo_margin: Optional[float] = None
+    rps_threshold: Optional[float] = None
+    rps_window: Optional[float] = None
+    tps_threshold: Optional[float] = None
+    tps_window: Optional[float] = None
+    use_bs_total: Optional[bool] = None
+
+
+@dataclass
+class SetFreqReq:
+    freq: int
+
+
+@dataclass
+class UnsetFreqReq:
+    pass
 
 
 @dataclass

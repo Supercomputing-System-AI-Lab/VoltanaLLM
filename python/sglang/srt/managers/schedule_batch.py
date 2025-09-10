@@ -454,6 +454,8 @@ class Req:
         bootstrap_port: Optional[int] = None,
         bootstrap_room: Optional[int] = None,
         data_parallel_rank: Optional[int] = None,
+        created_time: Optional[float] = None,
+        num_forward_repeat: Optional[int] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -626,6 +628,11 @@ class Req:
         # We use `tmp_end_idx` to store the end index of the kv cache to send.
         self.tmp_end_idx: int = -1
         self.metadata_buffer_index: int = -1
+
+        self.created_time: float = created_time
+        self.scheduled_time: float = None  # for ttft offsets
+        self.cur_token_time: float = None
+        self.num_forward_repeat = num_forward_repeat
 
     @property
     def seqlen(self):
@@ -814,6 +821,31 @@ bid = 0
 
 
 @dataclasses.dataclass
+class ExtraBatchInfo:
+    iteration_counter: int
+
+    # timestamp
+    timestamp_begin: float
+    timestamps_arrival: Optional[List[float]] = None  # arrival time of each request
+    timestamp_after_schedule: Optional[float] = None
+    timestamp_before_forward: Optional[float] = None
+    timestamp_after_forward: Optional[float] = None
+    timestamp_before_worker_iteration: Optional[float] = None
+    timestamp_after_worker_iteration: Optional[float] = None
+    timestamp_before_output: Optional[float] = None
+
+    # energy
+    num_forward_repeat: int = 1
+    energy_forward: Optional[float] = None
+
+    # info
+    batch_size: Optional[int] = None
+    num_total_computed_tokens_list: Tuple[int] = ()
+    num_total_computing_tokens_list: Tuple[int] = ()
+    forward_mode: Optional[ForwardMode] = None
+
+
+@dataclasses.dataclass
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
 
@@ -908,6 +940,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Whether to return hidden states
     return_hidden_states: bool = False
 
+    extra_batch_info: Optional[ExtraBatchInfo] = None
+
+    num_forward_repeat: Optional[int] = 1
+
     @classmethod
     def init_new(
         cls,
@@ -920,6 +956,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         spec_algorithm: SpeculativeAlgorithm,
         enable_custom_logit_processor: bool,
         chunked_req: Optional[Req] = None,
+        num_forward_repeat: Optional[int] = None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
 
@@ -938,6 +975,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             enable_custom_logit_processor=enable_custom_logit_processor,
             return_hidden_states=any(req.return_hidden_states for req in reqs),
             chunked_req=chunked_req,
+            num_forward_repeat=num_forward_repeat,
         )
 
     def batch_size(self):
@@ -1383,6 +1421,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def retract_decode(self, server_args: ServerArgs):
         """Retract the decoding requests when there is not enough memory."""
+
+        logger.warn("--------------RETRACT--------------")
+
         sorted_indices = list(range(len(self.reqs)))
 
         # TODO(lsyin): improve retraction policy for radix cache
@@ -1747,6 +1788,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ),
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             launch_done=self.launch_done,
+            num_forward_repeat=self.num_forward_repeat,
         )
 
     def copy(self):
@@ -1760,6 +1802,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             decoding_reqs=self.decoding_reqs,
             spec_algorithm=self.spec_algorithm,
             enable_custom_logit_processor=self.enable_custom_logit_processor,
+            extra_batch_info=self.extra_batch_info,
+            num_forward_repeat=self.num_forward_repeat,
         )
 
     def __str__(self):
@@ -1837,6 +1881,8 @@ class ModelWorkerBatch:
     # Overlap event
     launch_done: Optional[threading.Event] = None
 
+    # Model forward repeat number
+    num_forward_repeat: Optional[int] = 1
 
 @triton.jit
 def write_req_to_token_pool_triton(

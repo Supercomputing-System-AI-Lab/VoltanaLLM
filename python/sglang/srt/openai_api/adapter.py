@@ -628,6 +628,7 @@ def v1_generate_request(
         bootstrap_host=all_requests[0].bootstrap_host,
         bootstrap_port=all_requests[0].bootstrap_port,
         bootstrap_room=all_requests[0].bootstrap_room,
+        num_forward_repeat=max(req.num_forward_repeat for req in all_requests),
     )
 
     return adapted_request, all_requests if len(all_requests) > 1 else all_requests[0]
@@ -888,12 +889,22 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                             else None
                         ),
                     )
+                    extra_batch_info = None
+                    if request.stream_options and request.stream_options.include_prompt:
+                        extra_batch_info = content["meta_info"]["extra_batch_info"]
+                    cur_token_time = content["meta_info"]["cur_token_time"]
+                    if cur_token_time is None:
+                        # if engine doesn't give the timestamp of current token
+                        cur_token_time = time.perf_counter()
+                        content["meta_info"]["cur_token_time"] = cur_token_time
                     chunk = CompletionStreamResponse(
                         id=content["meta_info"]["id"],
                         created=created,
                         object="text_completion",
                         choices=[choice_data],
                         model=request.model,
+                        extra_batch_info=extra_batch_info,
+                        cur_token_time=cur_token_time,
                     )
 
                     stream_buffers[index] = stream_buffer

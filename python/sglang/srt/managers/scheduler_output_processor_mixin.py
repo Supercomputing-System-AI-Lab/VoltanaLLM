@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import logging
 import threading
 import time
@@ -8,7 +9,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import BatchEmbeddingOut, BatchTokenIDOut
-from sglang.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch, ExtraBatchInfo
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
@@ -20,8 +21,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_FORCE_STREAM_INTERVAL = 50
-
+DEFAULT_FORCE_STREAM_INTERVAL = int(os.environ.get("DEFAULT_FORCE_STREAM_INTERVAL", "50"))
 
 class SchedulerOutputProcessorMixin:
     """
@@ -66,6 +66,27 @@ class SchedulerOutputProcessorMixin:
                         logits_output.input_token_logprobs = tuple(
                             logits_output.input_token_logprobs.tolist()
                         )
+
+            now = time.perf_counter()
+
+            if self.collect_extra_batch_info and (batch.extra_batch_info is not None):
+                batch.extra_batch_info.timestamp_before_forward = logits_output.timestamp_before_forward
+                batch.extra_batch_info.timestamp_after_forward = logits_output.timestamp_after_forward
+                batch.extra_batch_info.timestamp_before_worker_iteration = logits_output.timestamp_before_worker_iteration
+                batch.extra_batch_info.timestamp_after_worker_iteration = logits_output.timestamp_after_worker_iteration
+                batch.extra_batch_info.timestamp_before_output = now
+                batch.extra_batch_info.num_forward_repeat = logits_output.num_forward_repeat
+                batch.extra_batch_info.energy_forward = logits_output.energy_forward
+
+            ttfts_iter = []
+            for req in batch.reqs:
+                # exclude chunked requests
+                if len(req.fill_ids) == len(req.origin_input_ids):
+                    ttft = now - req.created_time
+                    ttfts_iter.append(ttft)
+                req.cur_token_time = now
+            if len(ttfts_iter) > 0:
+                self.last_ttft = sum(ttfts_iter) / len(ttfts_iter)
 
             hidden_state_offset = 0
 
@@ -180,7 +201,7 @@ class SchedulerOutputProcessorMixin:
                     # being chunked reqs' prefill is not finished
                     req.is_chunked -= 1
 
-        self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
+        self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req, batch.extra_batch_info)
 
     def process_batch_result_decode(
         self: Scheduler,
@@ -205,6 +226,28 @@ class SchedulerOutputProcessorMixin:
             next_token_ids = next_token_ids.tolist()
             if batch.return_logprob:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
+
+        now = time.perf_counter()
+
+        if self.collect_extra_batch_info and (batch.extra_batch_info is not None):
+            batch.extra_batch_info.timestamp_before_forward = logits_output.timestamp_before_forward
+            batch.extra_batch_info.timestamp_after_forward = logits_output.timestamp_after_forward
+            batch.extra_batch_info.timestamp_before_worker_iteration = logits_output.timestamp_before_worker_iteration
+            batch.extra_batch_info.timestamp_after_worker_iteration = logits_output.timestamp_after_worker_iteration
+            batch.extra_batch_info.timestamp_before_output = now
+            batch.extra_batch_info.num_forward_repeat = logits_output.num_forward_repeat
+            batch.extra_batch_info.energy_forward = logits_output.energy_forward
+
+        itls_iter = []
+        for req in batch.reqs:
+            if req.cur_token_time is not None:
+                itl = now - req.cur_token_time
+                itls_iter.append(itl)
+                if itl < 0.003:
+                    logger.info(f"abnormal itl detected {itl:.8f}")
+            req.cur_token_time = now
+        if len(itls_iter) > 0:
+            self.last_itl = sum(itls_iter) / len(itls_iter)
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
@@ -267,7 +310,7 @@ class SchedulerOutputProcessorMixin:
                 req.grammar.finished = req.finished()
 
         self.set_next_batch_sampling_info_done(batch)
-        self.stream_output(batch.reqs, batch.return_logprob)
+        self.stream_output(batch.reqs, batch.return_logprob, batch.extra_batch_info)
         self.token_to_kv_pool_allocator.free_group_end()
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
@@ -447,10 +490,11 @@ class SchedulerOutputProcessorMixin:
         reqs: List[Req],
         return_logprob: bool,
         skip_req: Optional[Req] = None,
+        extra_batch_info: Optional[ExtraBatchInfo] = None,
     ):
         """Stream the output to detokenizer."""
         if self.is_generation:
-            self.stream_output_generation(reqs, return_logprob, skip_req)
+            self.stream_output_generation(reqs, return_logprob, skip_req, extra_batch_info)
         else:  # embedding or reward model
             self.stream_output_embedding(reqs)
 
@@ -459,6 +503,7 @@ class SchedulerOutputProcessorMixin:
         reqs: List[Req],
         return_logprob: bool,
         skip_req: Optional[Req] = None,
+        extra_batch_info: Optional[ExtraBatchInfo] = None,
     ):
         rids = []
         finished_reasons: List[BaseFinishReason] = []
@@ -675,6 +720,8 @@ class SchedulerOutputProcessorMixin:
                     output_token_ids_logprobs_val,
                     output_token_ids_logprobs_idx,
                     output_hidden_states,
+                    cur_token_times=[req.cur_token_time for req in reqs],
+                    extra_batch_info=extra_batch_info,
                 )
             )
 

@@ -27,7 +27,8 @@ from sglang.srt.disaggregation.common.conn import (
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_local_ip_by_remote
+from sglang.srt.utils import get_local_ip_by_remote, get_bool_env_var
+from sglang.utils import measure_func_time, TimeMeasurementContext
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,7 @@ NixlEngineInfo: TypeAlias = Dict[str, Union[str, int]]
 
 GUARD = "NixlMsgGuard".encode("ascii")
 
+MEASURE_FUNC_TIME = get_bool_env_var("MEASURE_FUNC_TIME")
 
 @dataclasses.dataclass
 class TransferInfo:
@@ -159,6 +161,8 @@ class NixlKVManager(CommonKVManager):
             self.peer_names[agent_name] = self.agent.add_remote_agent(agent_metadata)
         return self.peer_names[agent_name]
 
+    # NOTE: real time consuming
+    @measure_func_time
     def send_kvcache(
         self,
         peer_name: str,
@@ -168,46 +172,59 @@ class NixlKVManager(CommonKVManager):
         dst_gpu_id: int,
         notif: str,
     ):
-        # group by indices
-        prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
-            prefill_kv_indices, dst_kv_indices
-        )
+        timer_prepare = TimeMeasurementContext("send_kvcache() prepare", enabled=MEASURE_FUNC_TIME, print_on_exit=True)
+        with timer_prepare:
+            # group by indices
+            prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
+                prefill_kv_indices, dst_kv_indices
+            )
 
-        logger.debug(f"sending kvcache to {peer_name} with notif {notif}")
-        # Make descs
-        num_layers = len(self.kv_args.kv_data_ptrs)
-        src_addrs = []
-        dst_addrs = []
-        for layer_id in range(num_layers):
-            src_ptr = self.kv_args.kv_data_ptrs[layer_id]
-            dst_ptr = dst_kv_ptrs[layer_id]
-            item_len = self.kv_args.kv_item_lens[layer_id]
+            logger.debug(f"sending kvcache to {peer_name} with notif {notif}")
+            # Make descs
+            num_layers = len(self.kv_args.kv_data_ptrs)
+            src_addrs = []
+            dst_addrs = []
+            for layer_id in range(num_layers):
+                src_ptr = self.kv_args.kv_data_ptrs[layer_id]
+                dst_ptr = dst_kv_ptrs[layer_id]
+                item_len = self.kv_args.kv_item_lens[layer_id]
 
-            for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
-                src_addr = src_ptr + int(prefill_index[0]) * item_len
-                dst_addr = dst_ptr + int(decode_index[0]) * item_len
-                length = item_len * len(prefill_index)
-                src_addrs.append((src_addr, length, self.kv_args.gpu_id))
-                dst_addrs.append((dst_addr, length, dst_gpu_id))
+                for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
+                    src_addr = src_ptr + int(prefill_index[0]) * item_len
+                    dst_addr = dst_ptr + int(decode_index[0]) * item_len
+                    length = item_len * len(prefill_index)
+                    src_addrs.append((src_addr, length, self.kv_args.gpu_id))
+                    dst_addrs.append((dst_addr, length, dst_gpu_id))
 
-        logger.debug(
-            f"len(src_addrs): before group: {len(prefill_kv_indices)}, after group: {len(src_addrs)}"
-        )
-        src_descs = self.agent.get_xfer_descs(src_addrs, "VRAM", is_sorted=True)
-        dst_descs = self.agent.get_xfer_descs(dst_addrs, "VRAM", is_sorted=True)
-        # Transfer data
-        xfer_handle = self.agent.initialize_xfer(
-            "WRITE",
-            src_descs,
-            dst_descs,
-            peer_name,
-            notif.encode("ascii"),  # type: ignore
-        )
-        if not xfer_handle:
-            raise Exception("KVSender failed to create transfer")
-        state = self.agent.transfer(xfer_handle)
-        if state == "ERR":
-            raise Exception("KVSender failed to post transfer")
+            logger.debug(
+                f"len(src_addrs): before group: {len(prefill_kv_indices)}, after group: {len(src_addrs)}"
+            )
+
+        timer_src_descs = TimeMeasurementContext("send_kvcache() get src_descs", enabled=MEASURE_FUNC_TIME, print_on_exit=True)
+        with timer_src_descs:
+            src_descs = self.agent.get_xfer_descs(src_addrs, "VRAM", is_sorted=True)
+
+        timer_dst_descs = TimeMeasurementContext("send_kvcache() get dst_descs", enabled=MEASURE_FUNC_TIME, print_on_exit=True)
+        with timer_dst_descs:
+            dst_descs = self.agent.get_xfer_descs(dst_addrs, "VRAM", is_sorted=True)
+
+        timer_init_xfer = TimeMeasurementContext("send_kvcache() init_xfer", enabled=MEASURE_FUNC_TIME, print_on_exit=True)
+        with timer_init_xfer:
+            # Transfer data
+            xfer_handle = self.agent.initialize_xfer(
+                "WRITE",
+                src_descs,
+                dst_descs,
+                peer_name,
+                notif.encode("ascii"),  # type: ignore
+            )
+            if not xfer_handle:
+                raise Exception("KVSender failed to create transfer")
+
+        timer_xfer = TimeMeasurementContext("send_kvcache() xfer", enabled=MEASURE_FUNC_TIME, print_on_exit=True)
+        with timer_xfer:
+            state = self.agent.transfer(xfer_handle)  # NOTE: real time consuming
+
         return xfer_handle
 
     def send_aux(
@@ -243,6 +260,8 @@ class NixlKVManager(CommonKVManager):
             raise Exception("KVSender failed to post transfer")
         return xfer_handle
 
+    # NOTE: time consuming
+    @measure_func_time
     def add_transfer_request(
         self,
         bootstrap_room: int,
@@ -371,6 +390,8 @@ class NixlKVSender(BaseKVSender):
         self.num_kv_indices = num_kv_indices
         self.aux_index = aux_index
 
+    # NOTE: time consuming
+    @measure_func_time
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
