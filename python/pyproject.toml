@@ -17,6 +17,7 @@ dependencies = ["aiohttp", "requests", "tqdm", "numpy", "IPython", "setproctitle
 
 [project.optional-dependencies]
 runtime_common = [
+    "atomics",
     "blobfile==3.0.0",
     "build",
     "compressed-tensors",
@@ -37,7 +38,7 @@ runtime_common = [
     "prometheus-client>=0.20.0",
     "psutil",
     "pydantic",
-    "pynvml",
+    "nvidia-ml-py",
     "python-multipart",
     "pyzmq>=25.1.2",
     "soundfile==0.13.1",

@@ -21,11 +21,16 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
+import os
+import pickle
 from collections import deque
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional
 
+import numpy as np
 import torch
+import zmq
 
 from sglang.srt.disaggregation.base import BaseKVManager, KVPoll
 from sglang.srt.disaggregation.utils import (
@@ -42,9 +47,9 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce,
     prepare_abort,
 )
-from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import FINISH_LENGTH, ExtraBatchInfo, Req, ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.utils import require_mlp_sync
+from sglang.utils import measure_func_time
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -93,6 +98,8 @@ class PrefillBootstrapQueue:
         self.gpu_id = gpu_id
         self.bootstrap_port = bootstrap_port
         self.queue: List[Req] = []
+        self.pp_rank = pp_rank
+        self.pp_size = pp_size
         self.gloo_group = gloo_group
         self.max_total_num_tokens = max_total_num_tokens
         self.scheduler = scheduler
@@ -122,9 +129,6 @@ class PrefillBootstrapQueue:
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
-        if not self.is_mla_backend:
-            kv_args.kv_head_num = self.token_to_kv_pool.head_num
-        kv_args.page_size = self.token_to_kv_pool.page_size
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
             self.metadata_buffers.get_buf_infos()
@@ -267,6 +271,14 @@ class SchedulerDisaggregationPrefillMixin:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
 
         while True:
+
+            if self.collect_extra_batch_info:
+                extra_batch_info = ExtraBatchInfo(
+                    iteration_counter = self.iteration_counter,
+                    timestamp_begin = time.perf_counter(),
+                )
+            self.iteration_counter += 1
+
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             self.waiting_queue.extend(
@@ -275,9 +287,40 @@ class SchedulerDisaggregationPrefillMixin:
             self.process_prefill_chunk()
             batch = self.get_new_batch_prefill()
 
-            if require_mlp_sync(self.server_args):
-                batch = self.prepare_mlp_sync_batch(batch)
+            # Handle DP attention
+            if (
+                self.server_args.enable_dp_attention
+                or self.server_args.enable_sp_layernorm
+            ):
+                batch, _ = self.prepare_dp_attn_batch(batch)
             self.cur_batch = batch
+
+            if self.collect_extra_batch_info and (batch is not None):
+                batch.extra_batch_info = extra_batch_info
+                extra_batch_info.timestamps_arrival = [
+                    req.created_time for req in batch.reqs
+                ]
+                extra_batch_info.timestamp_after_schedule = time.perf_counter()
+                extra_batch_info.batch_size = len(batch.reqs)
+                extra_batch_info.num_total_computed_tokens_list = tuple(
+                    len(req.prefix_indices) for req in batch.reqs
+                )
+                extra_batch_info.num_total_computing_tokens_list = tuple(
+                    req.extend_input_len for req in batch.reqs
+                )
+                extra_batch_info.forward_mode = batch.forward_mode
+                if self.server_args.collect_iteration_energy:
+                    if self.server_args.num_forward_repeat:
+                        batch.num_forward_repeat = self.server_args.num_forward_repeat
+                    else:
+                        batch.num_forward_repeat = max(req.num_forward_repeat for req in batch.reqs)
+
+            if self.monitor_iteration_metrics and (self.pp_rank == 0 and self.attn_tp_rank == 0) and (batch is not None) and batch.forward_mode.is_extend():
+                now = time.perf_counter()
+                for req in batch.reqs:
+                    req.scheduled_time = now
+                metrics = self.get_metrics_for_freq(batch)
+                self.send_to_freq_manager.send_pyobj(metrics, copy=False, flags=zmq.NOBLOCK, protocol=pickle.HIGHEST_PROTOCOL)
 
             if batch:
                 result = self.run_batch(batch)
@@ -309,8 +352,12 @@ class SchedulerDisaggregationPrefillMixin:
             self.process_prefill_chunk()
             batch = self.get_new_batch_prefill()
 
-            if require_mlp_sync(self.server_args):
-                batch = self.prepare_mlp_sync_batch(batch)
+            # Handle DP attention
+            if (
+                self.server_args.enable_dp_attention
+                or self.server_args.enable_sp_layernorm
+            ):
+                batch, _ = self.prepare_dp_attn_batch(batch)
             self.cur_batch = batch
             if batch:
                 result = self.run_batch(batch)
@@ -346,6 +393,7 @@ class SchedulerDisaggregationPrefillMixin:
             # Otherwise, it hangs under high concurrency
             self.running_batch.batch_is_full = False
 
+    @measure_func_time
     def process_batch_result_disagg_prefill(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -387,7 +435,27 @@ class SchedulerDisaggregationPrefillMixin:
                         logits_output.input_token_logprobs.tolist()
                     )
 
-        hidden_state_offset = 0
+        now = time.perf_counter()
+
+        if self.collect_extra_batch_info and (batch.extra_batch_info is not None):
+            batch.extra_batch_info.timestamp_before_forward = logits_output.timestamp_before_forward
+            batch.extra_batch_info.timestamp_after_forward = logits_output.timestamp_after_forward
+            batch.extra_batch_info.timestamp_before_worker_iteration = logits_output.timestamp_before_worker_iteration
+            batch.extra_batch_info.timestamp_after_worker_iteration = logits_output.timestamp_after_worker_iteration
+            batch.extra_batch_info.timestamp_before_output = now
+            batch.extra_batch_info.num_forward_repeat = logits_output.num_forward_repeat
+            batch.extra_batch_info.energy_forward = logits_output.energy_forward
+
+        ttfts_iter = []
+        for req in batch.reqs:
+            # exclude chunked requests
+            if len(req.fill_ids) == len(req.origin_input_ids):
+                ttft = now - req.created_time
+                ttfts_iter.append(ttft)
+            req.cur_token_time = now
+        if len(ttfts_iter) > 0:
+            self.last_ttft = max(ttfts_iter)
+
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
@@ -397,16 +465,6 @@ class SchedulerDisaggregationPrefillMixin:
                 req.output_ids.append(next_token_id)
                 self.tree_cache.cache_unfinished_req(req)  # update the tree and lock
                 self.disagg_prefill_inflight_queue.append(req)
-                if logits_output.hidden_states is not None:
-                    last_hidden_index = (
-                        hidden_state_offset + extend_input_len_per_req[i] - 1
-                    )
-                    req.hidden_states_tensor = (
-                        logits_output.hidden_states[last_hidden_index].cpu().clone()
-                    )
-                    hidden_state_offset += extend_input_len_per_req[i]
-                else:
-                    req.hidden_states_tensor = None
                 if req.return_logprob:
                     assert extend_logprob_start_len_per_req is not None
                     assert extend_input_len_per_req is not None
@@ -556,6 +614,8 @@ class SchedulerDisaggregationPrefillMixin:
                 self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
                 self.running_batch.batch_is_full = False
 
+    # NOTE: time consuming
+    @measure_func_time
     def send_kv_chunk(
         self: Scheduler,
         req: Req,

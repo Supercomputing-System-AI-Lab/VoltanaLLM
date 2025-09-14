@@ -10,8 +10,19 @@ from sglang.srt.disaggregation.base.conn import (
     BaseKVSender,
     KVPoll,
 )
+from sglang.srt.disaggregation.common.conn import (
+    CommonKVBootstrapServer,
+    CommonKVManager,
+)
 
 logger = logging.getLogger(__name__)
+
+
+class FakeKVManager(CommonKVManager):
+    pass
+
+class FakeKVBootstrapServer(CommonKVBootstrapServer):
+    pass
 
 
 # For warmup reqs, we don't kv transfer, we use the fake sender and receiver

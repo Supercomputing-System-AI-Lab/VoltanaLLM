@@ -1,77 +1,136 @@
-<div align="center" id="sglangtop">
-<img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png" alt="logo" width="400" margin="10px"></img>
+# VoltanaLLM: Feedback-Driven Frequency Control and State-Space Routing for Energy-Efficient LLM Serving
 
-[![PyPI](https://img.shields.io/pypi/v/sglang)](https://pypi.org/project/sglang)
-![PyPI - Downloads](https://img.shields.io/pypi/dm/sglang)
-[![license](https://img.shields.io/github/license/sgl-project/sglang.svg)](https://github.com/sgl-project/sglang/tree/main/LICENSE)
-[![issue resolution](https://img.shields.io/github/issues-closed-raw/sgl-project/sglang)](https://github.com/sgl-project/sglang/issues)
-[![open issues](https://img.shields.io/github/issues-raw/sgl-project/sglang)](https://github.com/sgl-project/sglang/issues)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/sgl-project/sglang)
-
-</div>
-
---------------------------------------------------------------------------------
-
-| [**Blog**](https://lmsys.org/blog/2025-05-05-large-scale-ep/)
-| [**Documentation**](https://docs.sglang.ai/)
-| [**Join Slack**](https://slack.sglang.ai/)
-| [**Join Bi-Weekly Development Meeting**](https://meeting.sglang.ai/)
-| [**Roadmap**](https://github.com/sgl-project/sglang/issues/4042)
-| [**Slides**](https://github.com/sgl-project/sgl-learning-materials?tab=readme-ov-file#slides) |
+<p align="center">
+  <a href="https://arxiv.org/abs/2509.04827"><img src="https://img.shields.io/badge/Paper-PDF-blue" alt="Arxiv Paper"></a>
+  <a href="https://supercomputing-system-ai-lab.github.io/blogs/blog/voltanallm/"><img src="https://img.shields.io/badge/project-page-purple" alt="Project Blog"></a>
+</p>
 
 ## News
-- [2025/06] 🔥 SGLang, the high-performance serving infrastructure powering trillions of tokens daily, has been awarded the third batch of the Open Source AI Grant by a16z ([a16z blog](https://a16z.com/advancing-open-source-ai-through-benchmarks-and-bold-experimentation/)).
-- [2025/06] 🔥 Deploying DeepSeek on GB200 NVL72 with PD and Large Scale EP (Part I): 2.7x Higher Decoding Throughput ([blog](https://lmsys.org/blog/2025-06-16-gb200-part-1/)).
-- [2025/05] 🔥 Deploying DeepSeek with PD Disaggregation and Large-scale Expert Parallelism on 96 H100 GPUs ([blog](https://lmsys.org/blog/2025-05-05-large-scale-ep/)).
-- [2025/03] Supercharge DeepSeek-R1 Inference on AMD Instinct MI300X ([AMD blog](https://rocm.blogs.amd.com/artificial-intelligence/DeepSeekR1-Part2/README.html))
-- [2025/03] SGLang Joins PyTorch Ecosystem: Efficient LLM Serving Engine ([PyTorch blog](https://pytorch.org/blog/sglang-joins-pytorch/))
-- [2025/01] 🔥 SGLang provides day one support for DeepSeek V3/R1 models on NVIDIA and AMD GPUs with DeepSeek-specific optimizations. ([instructions](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3), [AMD blog](https://www.amd.com/en/developer/resources/technical-articles/amd-instinct-gpus-power-deepseek-v3-revolutionizing-ai-development-with-sglang.html), [10+ other companies](https://x.com/lmsysorg/status/1887262321636221412))
-- [2024/12] 🔥 v0.4 Release: Zero-Overhead Batch Scheduler, Cache-Aware Load Balancer, Faster Structured Outputs ([blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/)).
-- [2024/07] v0.2 Release: Faster Llama3 Serving with SGLang Runtime (vs. TensorRT-LLM, vLLM) ([blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/)).
 
-<details>
-<summary>More</summary>
-
-- [2025/02] Unlock DeepSeek-R1 Inference Performance on AMD Instinct™ MI300X GPU ([AMD blog](https://rocm.blogs.amd.com/artificial-intelligence/DeepSeekR1_Perf/README.html))
-- [2024/10] The First SGLang Online Meetup ([slides](https://github.com/sgl-project/sgl-learning-materials?tab=readme-ov-file#the-first-sglang-online-meetup)).
-- [2024/09] v0.3 Release: 7x Faster DeepSeek MLA, 1.5x Faster torch.compile, Multi-Image/Video LLaVA-OneVision ([blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/)).
-- [2024/02] SGLang enables **3x faster JSON decoding** with compressed finite state machine ([blog](https://lmsys.org/blog/2024-02-05-compressed-fsm/)).
-- [2024/01] SGLang provides up to **5x faster inference** with RadixAttention ([blog](https://lmsys.org/blog/2024-01-17-sglang/)).
-- [2024/01] SGLang powers the serving of the official **LLaVA v1.6** release demo ([usage](https://github.com/haotian-liu/LLaVA?tab=readme-ov-file#demo)).
-
-</details>
+- 2025-09-13: VoltanaLLM's code (v0.1) has been released.
 
 ## About
-SGLang is a fast serving framework for large language models and vision language models.
-It makes your interaction with models faster and more controllable by co-designing the backend runtime and frontend language.
-The core features include:
 
-- **Fast Backend Runtime**: Provides efficient serving with RadixAttention for prefix caching, zero-overhead CPU scheduler, prefill-decode disaggregation, speculative decoding, continuous batching, paged attention, tensor parallelism, pipeline parallelism, expert parallelism, structured outputs, chunked prefill, quantization (FP8/INT4/AWQ/GPTQ), and multi-lora batching.
-- **Flexible Frontend Language**: Offers an intuitive interface for programming LLM applications, including chained generation calls, advanced prompting, control flow, multi-modal inputs, parallelism, and external interactions.
-- **Extensive Model Support**: Supports a wide range of generative models (Llama, Gemma, Mistral, Qwen, DeepSeek, LLaVA, etc.), embedding models (e5-mistral, gte, mcdse) and reward models (Skywork), with easy extensibility for integrating new models.
-- **Active Community**: SGLang is open-source and backed by an active community with industry adoption.
+VoltanaLLM is a system for SLO-aware, energy-efficient LLM serving, built from a control theory perspective.
+It co-designs **frequency scaling** and **request routing** in **P/D disaggregated** architectures, leveraging their decoupled execution to enable fine-grained phase-specific control.
+Our evaluation shows it can achieve up to **36.3%** energy reduce compared to static max-frequency baseline.
 
-## Getting Started
-- [Install SGLang](https://docs.sglang.ai/start/install.html)
-- [Quick Start](https://docs.sglang.ai/backend/send_request.html)
-- [Backend Tutorial](https://docs.sglang.ai/backend/openai_api_completions.html)
-- [Frontend Tutorial](https://docs.sglang.ai/frontend/frontend.html)
-- [Contribution Guide](https://docs.sglang.ai/references/contribution_guide.html)
+VoltanaLLM is built on top of [SGLang v0.4.7.post1](https://github.com/sgl-project/sglang/tree/v0.4.7.post1).
 
-## Benchmark and Performance
-Learn more in the release blogs: [v0.2 blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/), [v0.3 blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/), [v0.4 blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/).
+## Features
 
-## Roadmap
-[Development Roadmap (2025 H1)](https://github.com/sgl-project/sglang/issues/4042)
+VoltanaLLM has the following key capabilities:
 
-## Adoption and Sponsorship
-SGLang has been deployed at large scale, generating trillions of tokens in production every day. It is trusted and adopted by a broad range of leading enterprises and institutions, including xAI, NVIDIA, AMD, Google Cloud, Oracle Cloud, LinkedIn, Cursor, Voltage Park, Atlas Cloud, DataCrunch, Baseten, Nebius, Novita, InnoMatrix, RunPod, Stanford, UC Berkeley, UCLA, ETCHED, Jam & Tea Studios, Hyperbolic, as well as major technology organizations across North America and Asia. As an open-source LLM inference engine, SGLang has become the de facto standard in the industry, with production deployments running on over 100,000 GPUs worldwide.
+- **Energy Efficiency**: It adaptively lowers GPU frequency to significantly reduce energy consumption during LLM inference.
+- **SLO-aware Control**: Frequency scaling is SLO-aware so it will not compromise service quality. Users can make custom trade-offs between energy and latency by setting appropriate SLOs.
+- **Phase-Specific Optimization**: It applies independent frequency control for prefill and decode phases, which is critical for handling real-world workload variations. It also enables users to set their custom phase-specific SLOs.
+- **Lightweight Latency Prediction**: It uses a simple yet accurate and explainable linear regression model to predict latency (TTFT/ITL) in real-time, enabling fast and reliable control decisions.
 
-<img src="https://raw.githubusercontent.com/sgl-project/sgl-learning-materials/refs/heads/main/slides/adoption.png" alt="logo" width="800" margin="10px"></img>
+To achieve these capabilities, VoltanaLLM has three key designs:
 
-## Contact Us
+- **EcoFreq**: A feedback-based frequency controller that performs frequency scaling in a lightweight, phase-specific, and fine-grained (per-iteration) manner, to maximize energy efficiency while preserving SLO attainment.
+- **EcoRoute**: A router specifically designed for prefill-to-decode request routing. It mitigates boundary-induced energy inefficiency by analyzing and navigating in the state spaces of decode instances.
+- **EcoPred**: A lightweight yet accurate TTFT/ITL predictor. It utilizes collected profiling data and interpretable linear regression to estimate latencies.
 
-For enterprises interested in adopting or deploying SGLang at scale, including technical consulting, sponsorship opportunities, or partnership inquiries, please contact us at contact@sglang.ai.
+![main-arch](images/main-arch.png)
 
-## Acknowledgment
-We learned the design and reused code from the following projects: [Guidance](https://github.com/guidance-ai/guidance), [vLLM](https://github.com/vllm-project/vllm), [LightLLM](https://github.com/ModelTC/lightllm), [FlashInfer](https://github.com/flashinfer-ai/flashinfer), [Outlines](https://github.com/outlines-dev/outlines), and [LMQL](https://github.com/eth-sri/lmql).
+## Quick Start
+
+### Setup Environment
+
+Create conda environment:
+
+```shell
+conda create -n voltanallm python=3.12 nvidia/label/cuda-12.8.1::cuda-toolkit -y
+conda activate voltanallm
+```
+
+Build and install VoltanaLLM:
+
+```shell
+export MAX_JOBS=$(nproc)
+pip install -v -e "python[all]"
+```
+
+Install Flashinfer following the [instruction](https://docs.flashinfer.ai/installation.html).
+
+Install UCX and NIXL for P/D disaggregation:
+
+```shell
+## install UCX
+
+# make sure $CUDA_HOME is the directory of your CUDA toolkits
+# if you install cuda-toolkits by conda, you can set $CUDA_HOME as $CONDA_PREFIX
+# make a directory to install UCX, denote it as <PATH_TO_UCX>
+
+wget https://github.com/openucx/ucx/releases/download/v1.18.0/ucx-1.18.0.tar.gz
+tar xzf ucx-1.18.0.tar.gz
+cd ucx-1.18.0
+./configure                          \
+  --enable-shared                    \
+  --disable-static                   \
+  --disable-doxygen-doc              \
+  --enable-optimizations             \
+  --enable-cma                       \
+  --enable-devel-headers             \
+  --with-cuda=$CUDA_HOME             \
+  --with-verbs                       \
+  --with-dm                          \
+  --enable-mt                        \
+  --with-go=no                       \
+  --prefix=<PATH_TO_UCX>
+make -j
+make -j install-strip
+
+
+## install NIXL
+
+git clone https://github.com/ai-dynamo/nixl.git
+cd nixl
+git checkout 0.3.0
+
+# edit meson_options.txt, change this line:
+# option('gds_path', type: 'string', value: '<CUDA_HOME>/targets/x86_64-linux/', description: 'Path to GDS CuFile install')
+
+pip install . --config-settings=setup-args="-Ducx_path=<PATH_TO_UCX>"
+```
+
+Now you can run VoltanaLLM!
+
+### Simple Demo
+
+Check [voltana-llm-scripts/demo/README.md](voltana-llm-scripts/demo/README.md) to run a simple demo.
+
+### Build Latency Prediction Model
+
+Check [voltana-llm-scripts/predictions/README.md](voltana-llm-scripts/predictions/README.md) to build the latency prediction model on your own GPUs.
+
+<!-- ### Reproduce Paper Results
+
+Check [voltana-llm-scripts/evaluations/README.md](voltana-llm-scripts/evaluations/README.md) to reproduce results in our paper. -->
+
+## Evaluation
+
+We evaluate VoltanaLLM across different models (`Ministral-3b-instruct`/`Llama-3.1-8B-Instruct`/`Qwen3-32B`) and different datasets (ShareGPT and LMSYS-CHat-1M).
+The testbed is 4xA100-80G SXM4, with 2-prefill-2-decode (2P2D) system configuration.
+VoltanaLLM shows:
+
+- Energy savings: Up to **36.3%** vs. static max-frequency baseline.
+- SLO attainment: **Comparable** to always running at 1410 MHz (max-frequency).
+- Workload robustness: Benefits held across request rates, workloads, and SLO profiles.
+
+![main-result](images/main-result.png)
+
+## Citation
+
+```biblatex
+@misc{yu2025voltanallmfeedbackdrivenfrequencycontrol,
+      title={VoltanaLLM: Feedback-Driven Frequency Control and State-Space Routing for Energy-Efficient LLM Serving},
+      author={Jiahuan Yu and Aryan Taneja and Junfeng Lin and Minjia Zhang},
+      year={2025},
+      eprint={2509.04827},
+      archivePrefix={arXiv},
+      primaryClass={cs.DC},
+      url={https://arxiv.org/abs/2509.04827},
+}
+```

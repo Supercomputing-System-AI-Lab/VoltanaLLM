@@ -201,6 +201,7 @@ class TransferBackend(Enum):
     MOONCAKE = "mooncake"
     NIXL = "nixl"
     FAKE = "fake"
+    FAKENIXL = "fakenixl"
 
 
 class KVClassType(Enum):
@@ -212,8 +213,6 @@ class KVClassType(Enum):
 
 
 def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType):
-    from sglang.srt.disaggregation.fake import FakeKVReceiver, FakeKVSender
-
     if transfer_backend == TransferBackend.MOONCAKE:
         from sglang.srt.disaggregation.base import KVArgs
         from sglang.srt.disaggregation.mooncake import (
@@ -250,15 +249,39 @@ def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType):
         return class_mapping.get(class_type)
     elif transfer_backend == TransferBackend.FAKE:
         from sglang.srt.disaggregation.base import KVArgs
-        from sglang.srt.disaggregation.fake import FakeKVReceiver, FakeKVSender
+        from sglang.srt.disaggregation.fake import (
+            FakeKVBootstrapServer,
+            FakeKVManager,
+            FakeKVReceiver,
+            FakeKVSender,
+        )
 
         class_mapping = {
             KVClassType.KVARGS: KVArgs,
+            KVClassType.MANAGER: FakeKVManager,
             KVClassType.SENDER: FakeKVSender,
             KVClassType.RECEIVER: (FakeKVReceiver),
+            KVClassType.BOOTSTRAP_SERVER: FakeKVBootstrapServer,
         }
         return class_mapping.get(class_type)
+    elif transfer_backend == TransferBackend.FAKENIXL:
+        from sglang.srt.disaggregation.base import KVArgs
+        from sglang.srt.disaggregation.nixl import (
+            NixlKVBootstrapServer,
+            NixlKVManager,
+            FakeNixlKVReceiver,
+            FakeNixlKVSender,
+            FakeNixlKVManager,
+        )
 
+        class_mapping = {
+            KVClassType.KVARGS: KVArgs,
+            KVClassType.MANAGER: FakeNixlKVManager,
+            KVClassType.SENDER: FakeNixlKVSender,
+            KVClassType.RECEIVER: (FakeNixlKVReceiver),
+            KVClassType.BOOTSTRAP_SERVER: NixlKVBootstrapServer,
+        }
+        return class_mapping.get(class_type)
     raise ValueError(f"Unsupported transfer backend: {transfer_backend}")
 
 

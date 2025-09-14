@@ -17,20 +17,24 @@ processes (TokenizerManager, DetokenizerManager, Controller).
 """
 
 import copy
+import msgspec
+import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
-from sglang.srt.managers.schedule_batch import BaseFinishReason
-from sglang.srt.multimodal.mm_utils import has_valid_data
-from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.mm_utils import has_valid_data
 
-# Handle serialization of Image for pydantic
+# handle serialization of Image for pydantic
 if TYPE_CHECKING:
     from PIL.Image import Image
 else:
     Image = Any
+
+from sglang.srt.managers.schedule_batch import BaseFinishReason, ExtraBatchInfo
+from sglang.srt.openai_api.protocol import StreamOptions
+from sglang.srt.sampling.sampling_params import SamplingParams
 
 
 @dataclass
@@ -39,7 +43,6 @@ class SessionParams:
     rid: Optional[str] = None
     offset: Optional[int] = None
     replace: Optional[bool] = None
-    drop_previous_output: Optional[bool] = None
 
 
 AudioDataItem = Union[str, Dict]
@@ -108,6 +111,12 @@ class GenerateReqInput:
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
+
+    # openai stream options
+    stream_options: Optional[StreamOptions] = None
+
+    # Number of times to repeat the forward pass.
+    num_forward_repeat: Optional[int] = 1
 
     def contains_mm_input(self) -> bool:
         return has_valid_data(self.image_data) or has_valid_data(self.audio_data)
@@ -182,7 +191,6 @@ class GenerateReqInput:
         # Determine parallel sample count
         if self.sampling_params is None:
             self.parallel_sample_num = 1
-            return
         elif isinstance(self.sampling_params, dict):
             self.parallel_sample_num = self.sampling_params.get("n", 1)
         else:  # isinstance(self.sampling_params, list):
@@ -227,11 +235,11 @@ class GenerateReqInput:
 
         # Expand input based on type
         self._expand_inputs(num)
-        self._normalize_rid(num)
         self._normalize_lora_paths(num)
         self._normalize_image_data(num)
         self._normalize_audio_data(num)
         self._normalize_sampling_params(num)
+        self._normalize_rid(num)
         self._normalize_logprob_params(num)
         self._normalize_custom_logit_processor(num)
 
@@ -320,16 +328,8 @@ class GenerateReqInput:
         """Normalize request IDs for batch processing."""
         if self.rid is None:
             self.rid = [uuid.uuid4().hex for _ in range(num)]
-        elif isinstance(self.rid, str):
-            new_rids = [f"{self.rid}_{i}" for i in range(num)]
-            self.rid = new_rids
-        elif isinstance(self.rid, list):
-            if len(self.rid) != num:
-                raise ValueError(
-                    "The specified rids length mismatch with the batch_size for batch processing."
-                )
-        else:
-            raise ValueError("The rid should be a string or a list of strings.")
+        elif not isinstance(self.rid, list):
+            raise ValueError("The rid should be a list for batch processing.")
 
     def _normalize_logprob_params(self, num):
         """Normalize logprob-related parameters for batch processing."""
@@ -486,6 +486,11 @@ class TokenizedGenerateReqInput:
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
 
+    # Number of times to repeat the forward pass.
+    num_forward_repeat: int = 1
+
+    # The timestamp when this request is created
+    created_time: float = field(default_factory=time.perf_counter)
 
 @dataclass
 class EmbeddingReqInput:
@@ -517,6 +522,9 @@ class EmbeddingReqInput:
     # For cross-encoder requests
     is_cross_encoder_request: bool = False
 
+    def contains_mm_input(self) -> bool:
+        return has_valid_data(self.image_data) or has_valid_data(self.audio_data)
+
     def normalize_batch_and_arguments(self):
         # at least one of text, input_ids, or image should be provided
         if self.text is None and self.input_ids is None and self.image_data is None:
@@ -536,7 +544,6 @@ class EmbeddingReqInput:
         if self.text is not None:
             if isinstance(self.text, list):
                 self.batch_size += len(self.text)
-                self.is_single = False
             else:
                 self.batch_size += 1
 
@@ -544,9 +551,11 @@ class EmbeddingReqInput:
         if self.input_ids is not None:
             if isinstance(self.input_ids[0], list):
                 self.batch_size += len(self.input_ids)
-                self.is_single = False
             else:
                 self.batch_size += 1
+
+        if self.batch_size > 1:
+            self.is_single = False
 
         # Fill in default arguments
         if self.is_single:
@@ -569,9 +578,6 @@ class EmbeddingReqInput:
     def regenerate_rid(self):
         self.rid = uuid.uuid4().hex
         return self.rid
-
-    def contains_mm_input(self) -> bool:
-        return has_valid_data(self.image_data) or has_valid_data(self.audio_data)
 
     def __getitem__(self, i):
         if self.is_cross_encoder_request:
@@ -649,6 +655,11 @@ class BatchTokenIDOut:
     # Hidden states
     output_hidden_states: List[List[float]]
 
+    # token generation time in the scheduler
+    cur_token_times: List[float]
+
+    # stats of engine iteration
+    extra_batch_info: Optional[ExtraBatchInfo] = None
 
 @dataclass
 class BatchMultimodalDecodeReq:
@@ -696,6 +707,11 @@ class BatchStrOut:
     # Hidden states
     output_hidden_states: List[List[float]]
 
+    # token generation time in the scheduler
+    cur_token_times: List[float]
+
+    # stats of engine iteration
+    extra_batch_info: Optional[ExtraBatchInfo] = None
 
 @dataclass
 class BatchMultimodalOut:
@@ -741,8 +757,6 @@ class UpdateWeightFromDiskReqInput:
     model_path: str
     # The format to load the weights
     load_format: Optional[str] = None
-    # Whether to abort all requests before updating weights
-    abort_all_requests: bool = False
 
 
 @dataclass
@@ -755,15 +769,9 @@ class UpdateWeightFromDiskReqOutput:
 
 @dataclass
 class UpdateWeightsFromDistributedReqInput:
-    names: List[str]
-    dtypes: List[str]
-    shapes: List[List[int]]
-    # The group name
-    group_name: str = "weight_update_group"
-    # Whether to flush the cache after updating weights
-    flush_cache: bool = True
-    # Whether to abort all requests before updating weights
-    abort_all_requests: bool = False
+    name: str
+    dtype: str
+    shape: List[int]
 
 
 @dataclass
@@ -785,8 +793,6 @@ class UpdateWeightsFromTensorReqInput:
     load_format: Optional[str] = None
     # Whether to flush the cache after updating weights
     flush_cache: bool = True
-    # Whether to abort all requests before updating weights
-    abort_all_requests: bool = False
 
 
 @dataclass
@@ -830,9 +836,7 @@ class GetWeightsByNameReqOutput:
 
 @dataclass
 class ReleaseMemoryOccupationReqInput:
-    # Optional tags to identify the memory region, which is primarily used for RL
-    # Currently we only support `weights` and `kv_cache`
-    tags: Optional[List[str]] = None
+    pass
 
 
 @dataclass
@@ -842,9 +846,7 @@ class ReleaseMemoryOccupationReqOutput:
 
 @dataclass
 class ResumeMemoryOccupationReqInput:
-    # Optional tags to identify the memory region, which is primarily used for RL
-    # Currently we only support `weights` and `kv_cache`
-    tags: Optional[List[str]] = None
+    pass
 
 
 @dataclass
@@ -865,9 +867,7 @@ class SlowDownReqOutput:
 @dataclass
 class AbortReq:
     # The request id
-    rid: str = ""
-    # Whether to abort all requests
-    abort_all: bool = False
+    rid: str
 
 
 @dataclass
@@ -880,9 +880,62 @@ class GetInternalStateReqOutput:
     internal_state: Dict[Any, Any]
 
 
+# Information provided for frequency manager
+# @dataclass
+class MetricsForFreq(msgspec.Struct, gc=False):
+    timestamp: float
+    bs: int  # running batch size
+    total_bs: int  # including requests not in running
+    num_running_tokens: int
+    len_waiting_queue: int
+    # prefill
+    len_prefill_bootstrap_queue: int = None
+    len_prefill_inflight_queue: int = None
+    ttft_slo_offsets: List[float] = None
+    last_ttft: float = None
+    # decode
+    len_decode_prealloc_queue: int = None
+    len_decode_transfer_queue: int = None
+    len_decode_retracted_queue: int = None
+    last_itl: float = None
+
+
 @dataclass
 class SetInternalStateReq:
     server_args: Dict[str, Any]
+
+
+@dataclass
+class SetFreqManagerReq:
+    enabled: Optional[bool] = None
+    dummy_run: Optional[bool] = None
+    interval: Optional[float] = None
+    latency_lookup_table_path: Optional[str] = None
+    energy_lookup_table_path: Optional[str] = None
+    f_list: Optional[List[int]] = None
+    slo: Optional[float] = None
+    slo_margin: Optional[float] = None
+    rps_threshold: Optional[float] = None
+    rps_window: Optional[float] = None
+    tps_threshold: Optional[float] = None
+    tps_window: Optional[float] = None
+    use_bs_total: Optional[bool] = None
+
+
+@dataclass
+class SetFreqReq:
+    freq: int
+
+
+@dataclass
+class UnsetFreqReq:
+    pass
+
+
+@dataclass
+class V1RerankReqInput:
+    query: str
+    documents: List[str]
 
 
 @dataclass
@@ -1015,27 +1068,3 @@ class RpcReqInput:
 class RpcReqOutput:
     success: bool
     message: str
-
-
-@dataclass
-class LoadLoRAAdapterReqInput:
-    # The name of the lora module to newly loaded.
-    lora_name: str
-    # The path of loading.
-    lora_path: str
-
-
-@dataclass
-class UnloadLoRAAdapterReqInput:
-    # The name of lora module to unload.
-    lora_name: str
-
-
-@dataclass
-class LoRAUpdateResult:
-    success: bool
-    error_message: Optional[str] = None
-    loaded_adapters: Dict[str, str] = field(default_factory=dict)
-
-
-LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = LoRAUpdateResult
